@@ -19,7 +19,9 @@ from exploration.cifar import create_cifar_function_simple
 import gymnasium as gym
 import gymnasium as gym
 from PIL import Image
+from PIL import Image
 import imageio
+import wandb
 
 # Config Class from Notebook
 class Config:
@@ -190,18 +192,34 @@ def evaluation(eval_env, policy, step, cfg):
         mean_ep_rewards = np.mean(all_ep_rewards)
         max_ep_rewards = np.max(all_ep_rewards)
         print(f"Eval(iter={step}) mean: {mean_ep_rewards:.4f} max: {max_ep_rewards:.4f}")
+        
     return mean_ep_rewards
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--env-name', default='ALE/Breakout-v5')
+    parser.add_argument('--env-name', default='Pendulum-v1') # Changed default to current working one, or keep generic
     parser.add_argument('--noisy-tv', action='store_true')
     parser.add_argument('--seed', type=int, default=1)
     parser.add_argument('--steps', type=int, default=200000)
+    # WandB arguments
+    parser.add_argument('--wandb', action='store_true', help='Use WandB logging')
+    parser.add_argument('--wandb-project', default='Dreamer-LPM', help='WandB project name')
+    parser.add_argument('--wandb-entity', default=None, help='WandB entity')
+    parser.add_argument('--wandb-run-name', default=None, help='Run name')
     args = parser.parse_args()
     
     cfg = Config()
     cfg.iter = args.steps
+    
+    # Initialize WandB
+    if args.wandb:
+        wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_run_name,
+            config=vars(cfg),
+            mode="online"
+        )
     
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -281,9 +299,15 @@ def main():
             return obs, reward, terminated, truncated, info
 
     # Simple env factory
-    def make_env_simple(seed, noisy=False):
+    def make_env_simple(seed, env_name, noisy=False):
         # Use Pendulum as simple test env
-        env = gym.make("Pendulum-v1", render_mode="rgb_array")
+        if env_name == "MountainCarContinuous-v0":
+             env = gym.make("MountainCarContinuous-v0", render_mode="rgb_array")
+             trigger_thresh = 0.5
+        else:
+             env = gym.make("Pendulum-v1", render_mode="rgb_array")
+             trigger_thresh = 1.0
+
         env = RenderWrapper(env)
         from gymnasium.wrappers import ResizeObservation
         env = ResizeObservation(env, (64, 64))
@@ -291,13 +315,13 @@ def main():
         if noisy:
              get_cifar = create_cifar_function_simple()
              # Use Continuous Wrapper
-             env = NoisyTVWrapperContinuous(env, get_cifar, trigger_threshold=1.0)
+             env = NoisyTVWrapperContinuous(env, get_cifar, trigger_threshold=trigger_thresh)
         return env
 
-    env = make_env_simple(args.seed, args.noisy_tv)
+    env = make_env_simple(args.seed, args.env_name, args.noisy_tv)
     
     # Video Recording for Evaluation
-    eval_env = make_env_simple(args.seed + 100, args.noisy_tv)
+    eval_env = make_env_simple(args.seed + 100, args.env_name, args.noisy_tv)
     # Manual video saving in evaluation loop
     if not os.path.exists("videos"):
         os.makedirs("videos")
@@ -456,6 +480,12 @@ def main():
                 
                 total_reward_val = reward + intr_reward
                 
+                if args.wandb and done_flag: # Log when episode ends or periodically?
+                    # Logging per step might be heavy? No, usually okay for scalar.
+                    # But better to log per episode or update freq for efficiency?
+                    # Let's log intrinsic components
+                    pass 
+                
                 # print(f"LPM: ActErr={actual_error:.4f} PredErr={pred_error_est:.4f} Intr={intr_reward:.4f}")
             else:
                 total_reward_val = reward
@@ -473,6 +503,14 @@ def main():
                 agent.reset()
                 
                 print(f"Episode {total_episode} ExtReward: {np.mean(total_reward):.4f}")
+                
+                if args.wandb:
+                    wandb.log({
+                        "Episode/Extrinsic_Reward": np.mean(total_reward),
+                        "Episode/Steps": iteration,
+                        "Episode/ID": total_episode
+                    })
+                
                 total_reward = []
                 total_episode += 1
                 
@@ -574,6 +612,17 @@ def main():
             clip_grad_norm_(wm_params, cfg.gradient_clipping)
             wm_optimizer.step()
             
+            if args.wandb:
+                wandb.log({
+                    "Train/WM_Loss": wm_loss.item(),
+                    "Train/Obs_Loss": obs_loss.item(),
+                    "Train/Reward_Loss": reward_loss.item(),
+                    "Train/KL_Loss": kl_loss.item(),
+                    "Train/EP_Loss": ep_loss.item(), # Error Predictor Loss
+                    "Train/Intr_Reward_Mean": np.mean([r[2] for r in zip(*[observations, actions, rewards])]), # Wait rewards is tensor
+                    # Let's just log loss for now
+                }, step=iteration)
+            
             # --- Actor Critic Update ---
             flatten_rnn_hiddens = flatten_rnn_hiddens.detach()
             flatten_states = flatten_states.detach()
@@ -634,6 +683,12 @@ def main():
             clip_grad_norm_(critic.parameters(), cfg.gradient_clipping)
             critic_optimizer.step()
             
+            if args.wandb:
+                 wandb.log({
+                     "Train/Actor_Loss": actor_loss.item(),
+                     "Train/Critic_Loss": critic_loss.item()
+                 }, step=iteration)
+
             if (iteration + 1) % cfg.slow_critic_update == 0:
                 target_critic.load_state_dict(critic.state_dict())
                 
