@@ -193,7 +193,7 @@ class TruncNormalDist(TruncatedNormal):
 
 
 class RSSM(nn.Module):
-    def __init__(self, mlp_hidden_dim: int, rnn_hidden_dim: int, state_dim: int, num_classes: int, actino_dim: int):
+    def __init__(self, mlp_hidden_dim: int, rnn_hidden_dim: int, state_dim: int, num_classes: int, action_dim: int):
         super().__init__()
 
         self.rnn_hidden_dim = rnn_hidden_dim
@@ -505,16 +505,37 @@ class Critic(nn.Module):
         return mean
 
 
+class ErrorPredictor(nn.Module):
+    def __init__(self, hidden_dim: int, rnn_hidden_dim: int, state_dim: int, num_classes: int, action_dim: int):
+        super().__init__()
+        self.fc1 = nn.Linear(state_dim * num_classes + rnn_hidden_dim + action_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc4 = nn.Linear(hidden_dim, 1)
+
+    def forward(self, state: torch.tensor, rnn_hidden: torch.Tensor, action: torch.Tensor):
+        """
+        予測誤差を予測するモデル (LPM用)
+        """
+        hidden = F.elu(self.fc1(torch.cat([state, rnn_hidden, action], dim=1)))
+        hidden = F.elu(self.fc2(hidden))
+        hidden = F.elu(self.fc3(hidden))
+        pred_error = self.fc4(hidden)
+        return pred_error
+
+
+
 class Agent(nn.Module):
     """
     ActionModelに基づき行動を決定する. そのためにRSSMを用いて状態表現をリアルタイムで推論して維持するクラス
     """
-    def __init__(self, encoder, decoder, rssm, action_model):
+    def __init__(self, encoder, decoder, rssm, action_model, error_predictor=None):
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
         self.rssm = rssm
         self.action_model = action_model
+        self.error_predictor = error_predictor
 
         self.device = next(self.action_model.parameters()).device
         self.rnn_hidden = torch.zeros(1, rssm.rnn_hidden_dim, device=self.device)
@@ -539,6 +560,8 @@ class Agent(nn.Module):
             action, _, _  = self.action_model(state, self.rnn_hidden, eval=eval)
 
             # 次のステップのためにRNNの隠れ状態を更新しておく
+            self.last_state = state
+            self.last_rnn_hidden = self.rnn_hidden
             self.rnn_hidden = self.rssm.recurrent(state, action, self.rnn_hidden)
 
         return action.squeeze().cpu().numpy(), (obs_pred.squeeze().cpu().numpy().transpose(1, 2, 0) + 0.5).clip(0.0, 1.0)
@@ -546,14 +569,18 @@ class Agent(nn.Module):
     #RNNの隠れ状態をリセット
     def reset(self):
         self.rnn_hidden = torch.zeros(1, self.rssm.rnn_hidden_dim, device=self.device)
+        self.last_state = None
+        self.last_rnn_hidden = None
 
     def to(self, device):
         self.device = device
         self.encoder.to(device)
         self.decoder.to(device)
         self.rssm.to(device)
-        self.action_model.to(device)
+        if self.error_predictor:
+            self.error_predictor.to(device)
         self.rnn_hidden = self.rnn_hidden.to(device)
+        return self
 
 
 def preprocess_obs(obs):
