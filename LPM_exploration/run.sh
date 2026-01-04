@@ -1,0 +1,1 @@
+python main.py --env-name MsPacmanNoFrameskip-v4 --algo eme --use-gae --lr 1e-4 --clip-param 0.1 --value-loss-coef 0.5 --num-processes 64 --num-steps 128 --num-mini-batch 8 --ppo-epoch 3 --log-interval 1 --entropy-coef 0.001 --num-env-steps 50000000 --log-dir ~/atari/pacman_eme_wo_noise --seed 42 --noop 3
