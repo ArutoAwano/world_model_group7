@@ -115,19 +115,19 @@ graph TD
     Obs --> Encoder
     Encoder --> RSSM
     RSSM --> Actor
-    Actor -->|行動 (Action)| Environment
+    Actor -->|"行動 (Action)"| Environment
     
     %% Learning Loop
     RSSM --> Decoder
-    Decoder -->|再構成画像| Loss_Recons[再構成誤差]
+    Decoder -->|"再構成画像"| Loss_Recons["再構成誤差"]
     Obs -.-> Loss_Recons
     
     %% LPM Flow
     RSSM --> ErrorPredictor
     Actor --> ErrorPredictor
-    ErrorPredictor -->|予測誤差 (Pred Error)| Calc_Intr
-    Loss_Recons -->|実際の誤差 (Actual Error)| Calc_Intr
-    Calc_Intr -->|内的報酬 (Intrinsic Reward)| Critic
+    ErrorPredictor -->|"予測誤差 (Pred Error)"| Calc_Intr
+    Loss_Recons -->|"実際の誤差 (Actual Error)"| Calc_Intr
+    Calc_Intr -->|"内的報酬 (Intrinsic Reward)"| Critic
     Reward_Ext --> Critic
 
     classDef env fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
