@@ -193,6 +193,18 @@ class TruncNormalDist(TruncatedNormal):
 
 
 class RSSM(nn.Module):
+    """
+    Recurrent State Space Model (世界モデルの中核)
+    
+    【役割】
+    エージェントの「脳」にあたる部分です。
+    過去の記憶(RNN)と、現在の状況(State)を統合し、未来をシミュレーションします。
+    
+    【構成要素】
+    1. Transition Model (決定論的): RNN。過去の文脈を隠れ状態 h_t として保持します。
+    2. Prior Network (確率的): h_t から「次の状態 z_t」を予測します（目をつぶって想像）。
+    3. Posterior Network (確率的): h_t と「実際の観測画像 o_t」から「真の状態 z_t」を推論します（現実を見て修正）。
+    """
     def __init__(self, mlp_hidden_dim: int, rnn_hidden_dim: int, state_dim: int, num_classes: int, action_dim: int):
         super().__init__()
 
@@ -200,21 +212,32 @@ class RSSM(nn.Module):
         self.state_dim = state_dim
         self.num_classes = num_classes
 
-        # Recurrent model
-        # h_t = f(h_t-1, z_t-1, a_t-1)
+        # 1. Recurrent model (Transition Model)
+        # 役割: 時間的な記憶の更新
+        # 数式: h_t = f(h_{t-1}, z_{t-1}, a_{t-1})
+        # 入力: [前の記憶] + [前の状態] + [前の行動]
         self.transition_hidden = nn.Linear(state_dim * num_classes + action_dim, mlp_hidden_dim)
         self.transition = nn.GRUCell(mlp_hidden_dim, rnn_hidden_dim)
 
-        # transition predictor
+        # 2. Transition predictor (Prior Network)
+        # 役割: 未来予測 (Imagination)
+        # 数式: \hat{z}_t ~ p(z_t | h_t)
+        # 記憶(h_t)だけから、今の状態(z_t)はどうなっているはずかを予測します。
         self.prior_hidden = nn.Linear(rnn_hidden_dim, mlp_hidden_dim)
         self.prior_logits = nn.Linear(mlp_hidden_dim, state_dim * num_classes)
 
-        # representation model
+        # 3. Representation model (Posterior Network)
+        # 役割: 現実認識 (Observation)
+        # 数式: z_t ~ q(z_t | h_t, o_t)
+        # 記憶(h_t)に加えて、実際の画像特徴量(embedded_obs)を見て、状態認識を修正します。
+        # これが「正解データ」としてPriorの学習に使われます (KL Divergence)。
         self.posterior_hidden = nn.Linear(rnn_hidden_dim + 1536, mlp_hidden_dim)
         self.posterior_logits = nn.Linear(mlp_hidden_dim, state_dim * num_classes)
 
     def recurrent(self, state: torch.Tensor, action: torch.Tensor, rnn_hidden: torch.Tensor):
-        # recullent model: h_t = f(h_t-1, z_t-1, a_t-1)を計算する
+        """
+        Recurrent Step: h_t = f(h_t-1, z_t-1, a_t-1)
+        """
         hidden = F.elu(self.transition_hidden(torch.cat([state, action], dim=1)))
         rnn_hidden = self.transition(hidden, rnn_hidden)
 
@@ -470,6 +493,48 @@ class Actor(nn.Module):
         return action, action_log_prob, action_entropy
 
 
+class DiscreteActor(nn.Module):
+    def __init__(self, action_dim: int, hidden_dim: int, rnn_hidden_dim: int, state_dim: int, num_classes: int):
+        super().__init__()
+        self.fc1 = nn.Linear(state_dim * num_classes + rnn_hidden_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc4 = nn.Linear(hidden_dim, hidden_dim)
+        self.out = nn.Linear(hidden_dim, action_dim)
+
+    def forward(self, state: torch.tensor, rnn_hidden: torch.Tensor, eval: bool = False):
+        hidden = F.elu(self.fc1(torch.cat([state, rnn_hidden], dim=1)))
+        hidden = F.elu(self.fc2(hidden))
+        hidden = F.elu(self.fc3(hidden))
+        hidden = F.elu(self.fc4(hidden))
+        logits = self.out(hidden)
+
+        if eval:
+            # 評価時は決定論的(argmax)な行動をとる
+            action = torch.argmax(logits, dim=-1)
+            # action is (B,). DiscreteActor usually returns index for action?
+            # But RSSM expects OneHot or Something?
+            # RSSM: transition_hidden(state_dim*num + action_dim)
+            # It expects vector.
+            # If action is index, we need OneHot.
+            # But here we return index?
+            # Wait, let's check DiscreteActor convention.
+            # If RSSM expects (B, A), then we should return OneHot.
+            # But student_code implementation of DiscreteActor returns index in eval?
+            # Let's check non-eval path.
+            return action, None, None
+
+        # 探索時は確率的(Categorical分布)に行動選ぶ
+        action_dist = td.Independent(OneHotCategoricalStraightThrough(logits=logits), 1)
+        action = action_dist.sample()
+        
+        # log_prob of OneHotCategorical is (B,)
+        action_log_prob = action_dist.log_prob(action)
+        action_entropy = action_dist.entropy()
+        
+        return action, action_log_prob, action_entropy
+
+
 class Critic(nn.Module):
     def __init__(self, hidden_dim: int, rnn_hidden_dim: int, state_dim: int, num_classes: int):
         super().__init__()
@@ -506,20 +571,41 @@ class Critic(nn.Module):
 
 
 class ErrorPredictor(nn.Module):
+    """
+    LPM (Learning Progress Motivation) のための予測誤差予測モデル
+    
+    【役割】
+    エージェントが「自分の予測能力のなさ（＝難しさ）」をメタ認知するためのモデルです。
+    「今の状態」と「次の行動」から、「次の瞬間の世界モデルの予測誤差」を予測します。
+    
+    【入力】
+    - state (z_t)      : 確率的状態 (Latent State)。画像の抽象表現。
+    - rnn_hidden (h_t) : 決定論的状態 (Recurrent State)。時間的な文脈情報。
+    - action (a_t)     : これから取る行動。
+    
+    【出力】
+    - pred_error       : スカラー値。予測されるReconstruction Lossの大きさ。
+                         この値が大きい＝「この行動をとると未来が予測しにくい（未知/学習不足）」と判断されます。
+    """
     def __init__(self, hidden_dim: int, rnn_hidden_dim: int, state_dim: int, num_classes: int, action_dim: int):
         super().__init__()
+        # 入力: [確率的状態 z] + [RNN隠れ状態 h] + [行動 a]
+        # これらを結合して、未来の「難しさ」を推論します。
         self.fc1 = nn.Linear(state_dim * num_classes + rnn_hidden_dim + action_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc3 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc4 = nn.Linear(hidden_dim, 1)
+        self.fc4 = nn.Linear(hidden_dim, 1) # 出力は単一の数値(予測誤差)
 
     def forward(self, state: torch.tensor, rnn_hidden: torch.Tensor, action: torch.Tensor):
-        """
-        予測誤差を予測するモデル (LPM用)
-        """
-        hidden = F.elu(self.fc1(torch.cat([state, rnn_hidden, action], dim=1)))
+        # 1. 入力データを結合(concatenation)
+        x = torch.cat([state, rnn_hidden, action], dim=1)
+        
+        # 2. MLP(多層パーセプトロン)で計算
+        hidden = F.elu(self.fc1(x))
         hidden = F.elu(self.fc2(hidden))
         hidden = F.elu(self.fc3(hidden))
+        
+        # 3. 予測誤差(スカラー)を出力
         pred_error = self.fc4(hidden)
         return pred_error
 
@@ -541,30 +627,65 @@ class Agent(nn.Module):
         self.rnn_hidden = torch.zeros(1, rssm.rnn_hidden_dim, device=self.device)
 
     def __call__(self, obs, eval=True):
-        # preprocessを適用, PyTorchのためにChannel-Firstに変換
+        # 1. 前処理 & テンソル変換
+        # 画像を [0, 255] -> [-0.5, 0.5] に正規化し、PyTorch形式 (B, C, H, W) に合わせます。
         obs = preprocess_obs(obs)
         obs = torch.as_tensor(obs, device=self.device)
-        obs = obs.transpose(1, 2).transpose(0, 1).unsqueeze(0)
+        obs = obs.transpose(1, 2).transpose(0, 1).unsqueeze(0) # (1, C, H, W)
 
         with torch.no_grad():
-            # 現在の状態から次に得られる観測画像を予測する
+            # 2. Imagination (世界モデルによる未来予測 - 可視化用)
+            # 現在の記憶(RNN state)だけから「次の画像」を想像してみます。
+            # これは行動決定には使いませんが、デバッグ画面で「AIが見ている夢」を表示するために返します。
             state_prior = self.rssm.get_prior(self.rnn_hidden)
-            state = state_prior.sample().flatten(1)
-            obs_dist = self.decoder(state, self.rnn_hidden)
-            obs_pred = obs_dist.sample()
+            state_pred = state_prior.sample().flatten(1)
+            obs_dist = self.decoder(state_pred, self.rnn_hidden)
+            obs_pred_img = obs_dist.sample()
 
-            # 観測を低次元の表現に変換し, posteriorからのサンプルをActionModelに入力して行動を決定する
+            # 3. 状態認識 (State Estimation) - 「現実を見る」
+            # 実際の観測画像(obs)を使って、世界モデルの認識(Posterior)を更新します。
+            # 「目を閉じて予想していた状態」を「目で見た現実」で修正するプロセスです。
             embedded_obs = self.encoder(obs)
             state_posterior = self.rssm.get_posterior(self.rnn_hidden, embedded_obs)
             state = state_posterior.sample().flatten(1)
+            
+            # 4. 行動決定 (Action Selection)
+            # 「現在の正確な状態(z_t)」と「記憶(h_t)」を元に、Actorが次の行動を決めます。
             action, _, _  = self.action_model(state, self.rnn_hidden, eval=eval)
 
-            # 次のステップのためにRNNの隠れ状態を更新しておく
+            # 5. 記憶の更新 (Recurrent Step)
+            # 次のステップのために、現在の状態を保存します。
             self.last_state = state
             self.last_rnn_hidden = self.rnn_hidden
+            if state.ndim == 1:
+                state = state.unsqueeze(0)
+        
+            # Ensure action has batch dim
+            if action.ndim == 1:
+                action = action.unsqueeze(0)
+            
+            # If using DiscreteActor, RSSM expects One-Hot, but action_model might return scalar/logits?
+            # DiscreteActor returns One-Hot if we look at student_code.DiscreteActor...
+            # Wait, DiscreteActor in student_code returns Independent(OneHotCategorical(...)).sample().
+            # So it returns One-Hot vector (B, num_classes).
+            # BUT if action_dim mismatch occurs, it means action is scalar?
+            # Ah, maybe I was fixing phantom bug. The error "1025" (1024+1) suggests action IS size 1.
+            # So DiscreteActor.forward MUST return size 1?
+            # OneHotCategorical sample returns one-hot vector...
+            
+            # Let's check if action needs to be one-hot encoded manually if it's not.
+            # RSSM expects input size 1042 (1024 + 18).
+            # If action is size 1, we must one-hot encode it.
+            if action.shape[-1] == 1 and self.rssm.transition_hidden.in_features > (state.shape[-1] + 1):
+                 # Assume 18 classes
+                 num_classes = self.rssm.transition_hidden.in_features - state.shape[-1]
+                 # Action is likely index (float or int)
+                 action_idx = action.long()
+                 action = F.one_hot(action_idx, num_classes=num_classes).float().squeeze(1)
+            
             self.rnn_hidden = self.rssm.recurrent(state, action, self.rnn_hidden)
 
-        return action.squeeze().cpu().numpy(), (obs_pred.squeeze().cpu().numpy().transpose(1, 2, 0) + 0.5).clip(0.0, 1.0)
+        return action.squeeze().cpu().numpy(), (obs_pred_img.squeeze().cpu().numpy().transpose(1, 2, 0) + 0.5).clip(0.0, 1.0)
 
     #RNNの隠れ状態をリセット
     def reset(self):

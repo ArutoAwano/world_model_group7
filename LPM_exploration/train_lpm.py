@@ -1,4 +1,5 @@
 import sys
+import atexit
 import os
 import random
 import time
@@ -13,15 +14,76 @@ from torch.distributions.kl import kl_divergence
 from torch.nn.utils import clip_grad_norm_
 
 # Import from student_code and exploration
-from student_code import Agent, RSSM, Encoder, Decoder, RewardModel, DiscountModel, Actor, Critic, ErrorPredictor, MSE
+from student_code import Agent, RSSM, Encoder, Decoder, RewardModel, DiscountModel, Actor, DiscreteActor, Critic, ErrorPredictor, MSE
 from exploration.noisy_wrapper import NoisyTVEnvWrapperCIFAR
 from exploration.cifar import create_cifar_function_simple
 import gymnasium as gym
-import gymnasium as gym
-from PIL import Image
-from PIL import Image
 import imageio
+import craftium
+from PIL import Image
 import wandb
+from torchvision import datasets, transforms
+import random
+import os
+
+# Try importing stable_baselines3 wrappers if available, else define minimal ones
+try:
+    from stable_baselines3.common.atari_wrappers import (
+        NoopResetEnv, MaxAndSkipEnv, WarpFrame, ClipRewardEnv
+    )
+    SB3_AVAILABLE = True
+except ImportError:
+    SB3_AVAILABLE = False
+
+class MnistEnv(gym.Env):
+    def __init__(self, render_mode=None):
+        self.render_mode = render_mode
+        self.observation_space = gym.spaces.Box(low=0, high=255, shape=(64, 64, 3), dtype=np.uint8)
+        self.action_space = gym.spaces.Discrete(10) # Dummy action space
+        
+        # Load MNIST data
+        try:
+            self.mnist_data = datasets.MNIST('../data', train=True, download=True,
+                                           transform=transforms.Compose([
+                                               transforms.Resize((64, 64)),
+                                               transforms.ToTensor()
+                                           ]))
+        except:
+            # Fallback if download fails or internet issue, generate random noise or try local
+            print("Warning: Could not load actual MNIST, using random noise placeholder for MnistEnv")
+            self.mnist_data = None
+
+        self.current_idx = 0
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.current_idx = random.randint(0, len(self.mnist_data) - 1) if self.mnist_data else 0
+        return self._get_obs(), {}
+
+    def step(self, action):
+        # Action changes the image randomly to simulate "watching" different channels/digits
+        self.current_idx = random.randint(0, len(self.mnist_data) - 1) if self.mnist_data else 0
+        obs = self._get_obs()
+        reward = 0.0 # No extrinsic reward for just watching
+        terminated = False
+        truncated = False
+        return obs, reward, terminated, truncated, {}
+
+    def _get_obs(self):
+        if self.mnist_data:
+            img, _ = self.mnist_data[self.current_idx]
+            # Convert tensor (C, H, W) 0-1 to numpy (H, W, C) 0-255
+            img = img.permute(1, 2, 0).numpy() * 255.0
+            img = img.astype(np.uint8)
+            # MNIST is grayscale (1 channel), convert to RGB (3 channels) for consistency
+            if img.shape[2] == 1:
+                img = np.concatenate([img]*3, axis=2)
+            return img
+        else:
+            return np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)
+
+    def render(self):
+        return self._get_obs()
 
 # Config Class from Notebook
 class Config:
@@ -60,6 +122,7 @@ class Config:
         # learning period settings
         self.iter = 6000
         self.seed_iter = 1000 # Reduced for faster start in dev
+        self.eval_interval = 200
         self.eval_freq = 5
         self.eval_episodes = 5
         
@@ -175,11 +238,16 @@ def evaluation(eval_env, policy, step, cfg):
                 episode_reward.append(reward)
             
             # Save video for the first episode of evaluation
-            if i == 0:
+            if i == 0 and len(frames) > 0:
                 video_path = f"videos/eval_iter_{step}_ep_{i}.mp4"
                 try:
-                     imageio.mimsave(video_path, frames, fps=30)
-                     print(f"Saved video to {video_path}")
+                     # Ensure frames are uint8 numpy arrays
+                     frames = [np.array(f, dtype=np.uint8) for f in frames if f is not None]
+                     if len(frames) > 0:
+                        imageio.mimsave(video_path, frames, fps=30)
+                        print(f"Saved video to {video_path}")
+                     else:
+                        print("No valid frames to save.")
                 except Exception as e:
                      print(f"Failed to save video: {e}")
 
@@ -254,6 +322,31 @@ def main():
             obs = self.env.render()
             return obs, reward, terminated, truncated, info
 
+            return obs, reward, terminated, truncated, info
+
+    class NoisyTVWrapperDiscrete(gym.Wrapper):
+        def __init__(self, env, get_random_cifar_fn, trigger_prob=0.05):
+            super().__init__(env)
+            self.get_random_cifar = get_random_cifar_fn
+            self.trigger_prob = trigger_prob
+            
+        def step(self, action):
+            # For discrete, we just randomly trigger NoisyTV for exploration noise
+            # or trigger on specific action? Let's use random prob for simplicity or specific "do nothing"
+            is_noise = random.random() < self.trigger_prob
+            
+            obs, reward, terminated, truncated, info = self.env.step(action)
+            
+            if is_noise:
+                noise_img = self.get_random_cifar()
+                pil_img = Image.fromarray(noise_img)
+                pil_img = pil_img.resize((64, 64), Image.NEAREST)
+                obs = np.array(pil_img)
+                reward = 0.0
+            
+            info["noisy"] = is_noise
+            return obs, reward, terminated, truncated, info
+
     class NoisyTVWrapperContinuous(gym.Wrapper):
         def __init__(self, env, get_random_cifar_fn, trigger_threshold=1.5):
             super().__init__(env)
@@ -295,33 +388,77 @@ def main():
                 # Maybe zero reward if watching TV? Or keep env reward (which might be low/random)?
                 # Usually watching TV gives 0 extrinsic reward.
                 reward = 0.0
-                
+            
+            info["noisy"] = is_noise
             return obs, reward, terminated, truncated, info
 
     # Simple env factory
     def make_env_simple(seed, env_name, noisy=False):
-        # Use Pendulum as simple test env
-        if env_name == "MountainCarContinuous-v0":
+        env = None
+        trigger_thresh = None 
+        trigger_prob = 0.01
+
+        if env_name == "Craftium":
+            # Default to OpenWorld if just "Craftium" is specified
+            env = gym.make("Craftium/OpenWorld-v0", render_mode="rgb_array")
+        elif env_name.startswith("Craftium/"):
+            # Allow specific Craftium tasks (e.g., Craftium/ChopTree-v0)
+            env = gym.make(env_name, render_mode="rgb_array")
+        elif env_name == "MountainCarContinuous-v0":
              env = gym.make("MountainCarContinuous-v0", render_mode="rgb_array")
              trigger_thresh = 0.5
-        else:
+        elif env_name == "Pendulum-v1":
              env = gym.make("Pendulum-v1", render_mode="rgb_array")
              trigger_thresh = 1.0
-
-        env = RenderWrapper(env)
-        from gymnasium.wrappers import ResizeObservation
-        env = ResizeObservation(env, (64, 64))
+             trigger_prob = 0.05
+        elif env_name == "MNIST":
+            env = MnistEnv()
+            trigger_prob = 0.1
+        elif "ALE/" in env_name or "NoFrameskip" in env_name:
+            # Atari Environment Handling
+            env = gym.make(env_name, render_mode="rgb_array")
+            if SB3_AVAILABLE:
+                env = NoopResetEnv(env, noop_max=30)
+                env = MaxAndSkipEnv(env, skip=4)
+                # Common Atari Wrappers
+                # WarpFrame resizes to 84x84 grayscale, we might need 64x64 RGB
+                # So we might skip WarpFrame if we use ResizeObservation later
+            trigger_prob = 0.01
+        else:
+             try:
+                env = gym.make(env_name, render_mode="rgb_array")
+             except:
+                print(f"Could not make environment {env_name}, defaulting to Pendulum")
+                env = gym.make("Pendulum-v1", render_mode="rgb_array")
         
+        # Common Wrappers
+        if env_name != "Crafter" and not isinstance(env, MnistEnv):
+            # MnistEnv already outputs 64x64x3
+            # Ensure we resize to 64x64 for Dreamer
+            from gymnasium.wrappers import ResizeObservation
+            env = ResizeObservation(env, (64, 64))
+            
+            # Ensure RGB
+            # (Some Atari envs or wrappers might output grayscale, checking shape might be needed)
+        
+        if env_name != "Crafter":
+             env = RenderWrapper(env)
+
         if noisy:
              get_cifar = create_cifar_function_simple()
-             # Use Continuous Wrapper
-             env = NoisyTVWrapperContinuous(env, get_cifar, trigger_threshold=trigger_thresh)
+             if isinstance(env.action_space, gym.spaces.Box):
+                 if trigger_thresh is None: trigger_thresh = 0.0 # Default
+                 env = NoisyTVWrapperContinuous(env, get_cifar, trigger_threshold=trigger_thresh)
+             else:
+                 env = NoisyTVWrapperDiscrete(env, get_cifar, trigger_prob=trigger_prob)
         return env
 
     env = make_env_simple(args.seed, args.env_name, args.noisy_tv)
+    atexit.register(env.close)
     
     # Video Recording for Evaluation
     eval_env = make_env_simple(args.seed + 100, args.env_name, args.noisy_tv)
+    atexit.register(eval_env.close)
     # Manual video saving in evaluation loop
     if not os.path.exists("videos"):
         os.makedirs("videos")
@@ -343,7 +480,10 @@ def main():
     encoder = Encoder().to(device)
     decoder = Decoder(cfg.rnn_hidden_dim, cfg.state_dim, cfg.num_classes).to(device)
     reward_model = RewardModel(cfg.mlp_hidden_dim, cfg.rnn_hidden_dim, cfg.state_dim, cfg.num_classes).to(device)
-    actor = Actor(action_dim, cfg.mlp_hidden_dim, cfg.rnn_hidden_dim, cfg.state_dim, cfg.num_classes).to(device)
+    if isinstance(env.action_space, gym.spaces.Discrete):
+         actor = DiscreteActor(action_dim, cfg.mlp_hidden_dim, cfg.rnn_hidden_dim, cfg.state_dim, cfg.num_classes).to(device)
+    else:
+         actor = Actor(action_dim, cfg.mlp_hidden_dim, cfg.rnn_hidden_dim, cfg.state_dim, cfg.num_classes).to(device)
     critic = Critic(cfg.mlp_hidden_dim, cfg.rnn_hidden_dim, cfg.state_dim, cfg.num_classes).to(device)
     target_critic = Critic(cfg.mlp_hidden_dim, cfg.rnn_hidden_dim, cfg.state_dim, cfg.num_classes).to(device)
     target_critic.load_state_dict(critic.state_dict())
@@ -403,6 +543,11 @@ def main():
             obs = env.reset()
             if isinstance(obs, tuple): obs = obs[0]
             
+    # CSV Logging Setup
+    lpm_log_file = "lpm_stats.csv"
+    with open(lpm_log_file, "w") as f:
+        f.write("step,actual_error,pred_error,intr_reward,is_noisy\n")
+
     # Main Loop
     print("Starting Main Loop...")
     for iteration in range(cfg.iter):
@@ -420,73 +565,108 @@ def main():
             
             # agent returns action.squeeze().cpu().numpy().
             
-            # Action handling for Pendulum (Continuous)
-            if isinstance(env.action_space, gym.spaces.Box):
+            # Action handling
+            if isinstance(env.action_space, gym.spaces.Discrete):
+                 # One-Hot to Scalar
+                 if action.ndim > 1: # (B, A) -> (B,)
+                      action_scalar = np.argmax(action, axis=1)[0]
+                 else:
+                      action_scalar = np.argmax(action)
+                 
+                 # Prepare for step
+                 env_action = action_scalar
+            elif isinstance(env.action_space, gym.spaces.Box):
                  # Ensure action is distinct array (1,) for Pendulum, not scalar
                  if action.ndim == 0:
                      action = np.expand_dims(action, axis=0)
+                 env_action = action
             
             # For interaction
-            next_obs, reward, done, truncated, _ = env.step(action)
+            next_obs, reward, done, truncated, info = env.step(env_action)
             done_flag = done or truncated
             
-            # --- LPM Calculation ---
-            # 1. Actual Error
-            # pred_obs_normalized is normalized [-0.5, 0.5]
-            # next_obs is [0, 255]
-            # Convert next_obs to match pred
-            next_obs_normalized = preprocess_obs(next_obs) # [-0.5, 0.5]
+            # --- LPM (Learning Progress Motivation) Part ---
+            # 内発的報酬(Intrinsic Reward)の計算
+            # 数式: R_int = eta * (Predicted_Error - Actual_Error)
             
-            # Error is MSE between pred_obs (reconstruction of obs) and next_obs?
-            # NO! LPM requires prediction of NEXT obs.
-            # But Dreamer decoder predicts CURRENT obs from CURRENT state.
+            # 1. 実際の誤差 (Actual Error) の計算
+            # 次の画像(next_obs)がどれくらい予測しにくかったか？
+            # 注意: DreamerのDecoderは「現在の状態」から「現在の画像」を復元するものだが、
+            # ここでは「次の状態」を予測して「次の画像」と比較する必要がある。
             
-            # We need to predict NEXT obs.
-            # We can use agent.rssm to step forward using 'agent.last_state' and 'action'.
-            # agent.last_state: z_t
-            # agent.last_rnn_hidden: h_t
-            # action: a_t
-            # next_rnn: h_{t+1}, next_prior: z_{t+1}
-            # next_obs_pred: x_{t+1}
-            
-            # Ensure types for torch
-            t_last_state = agent.last_state # Already on device
-            t_last_rnn = agent.last_rnn_hidden
+            next_obs_normalized = preprocess_obs(next_obs)
+            t_last_state = agent.last_state # z_t (学習済みモデルで推論した確率的状態)
+            t_last_rnn = agent.last_rnn_hidden # h_t (学習済みモデルで推論した決定論的状態)
             
             if t_last_state is not None:
-                # Prepare action tensor
+                # ActionをTensorに変換
                 t_action = torch.as_tensor(action, device=device).unsqueeze(0) # (1, action_dim)
                 
-                # Predict Step
+                # (a) 未来の状態を予測 (Step Forward)
+                # h_{t+1} = f(h_t, z_t, a_t)
                 t_next_rnn = rssm.recurrent(t_last_state, t_action, t_last_rnn)
+                # p(z_{t+1} | h_{t+1})
                 t_next_prior = rssm.get_prior(t_next_rnn)
-                t_next_state = t_next_prior.mean.flatten(1) # Use mean or sample? Mean is deterministic prediction.
+                t_next_state = t_next_prior.mean.flatten(1) # 決定論的な予測(mean)を使用
                 
+                # (b) 未来の画像を予測 (Imagine Image)
+                # \hat{x}_{t+1} ~ p(x | h_{t+1}, z_{t+1})
                 t_next_obs_dist = decoder(t_next_state, t_next_rnn)
                 t_next_obs_pred = t_next_obs_dist.mean.squeeze().cpu().numpy() # (3, 64, 64)
                 t_next_obs_pred = t_next_obs_pred.transpose(1, 2, 0) # (64, 64, 3)
                 
-                # Actual Error (MSE) per pixel -> sum/mean
+                # (c) 実測値との誤差 (MSE)
+                # Normalized next_obs [-0.5, 0.5] vs Predicted [-0.5, 0.5]
                 actual_error = np.mean((next_obs_normalized - t_next_obs_pred)**2)
                 
-                # Predicted Error
+                # 2. 予測された誤差 (Predicted Error) の計算
+                # ErrorPredictorを使って「どれくらい誤差が出そうか」を事前予測
+                # Input: z_t, h_t, a_t
                 pred_error_est = error_predictor(t_last_state, t_last_rnn, t_action).item()
                 
-                # Intrinsic Reward
-                intr_reward = cfg.lpm_eta * (pred_error_est - actual_error)
+                # 3. 好奇心報酬 (Intrinsic Reward)
+                # 「予測誤差が大きい(難しい)」かつ「それが予想通り(予測可能)」なら報酬は小。
+                # 「予測誤差が大きい(難しい)」のに「予想では小さいと思っていた(未知の発見)」なら報酬は大...ではない。
+                # LPMの定義: 
+                # 原論文(Oudeyer et al.): Learning Progress = Error(t-1) - Error(t) (誤差の減少量)
+                # この実装: (Predicted Error - Actual Error)
+                #  差分が大きい = 「思っていたより誤差が小さかった」= 「学習が進んだ/上手くできた」場合などに正の報酬？
+                #  逆に、Noisy-TVのようなランダムなものは、常にActual Errorが大きく、Predicted Errorもそれに追従して大きくなるため、
+                #  差分（学習の進捗）はゼロに近づく、というロジック。
                 
-                # Clip?
+                # Fix: Error Predictor predicts Log(MSE), so we must compare with Log(Actual MSE)
+                actual_error_log = np.log(actual_error + 1e-6)
+                intr_reward = cfg.lpm_eta * (pred_error_est - actual_error_log)
+                
+                # 安定化のためのクリッピング
                 intr_reward = max(-1.0, min(1.0, intr_reward))
                 
                 total_reward_val = reward + intr_reward
                 
-                if args.wandb and done_flag: # Log when episode ends or periodically?
-                    # Logging per step might be heavy? No, usually okay for scalar.
-                    # But better to log per episode or update freq for efficiency?
-                    # Let's log intrinsic components
-                    pass 
-                
                 # print(f"LPM: ActErr={actual_error:.4f} PredErr={pred_error_est:.4f} Intr={intr_reward:.4f}")
+                
+                # Log LPM stats
+                is_noisy_step = info.get("noisy", False)
+                with open(lpm_log_file, "a") as f:
+                    f.write(f"{iteration},{actual_error},{pred_error_est},{intr_reward},{is_noisy_step}\n")
+
+                if args.wandb:
+                    # Log detailed LPM metrics every step or frequent enough? 
+                    # Logging every step is fine for debugging/analysis if run is not too long.
+                    # Separate metrics for Noisy vs Clean
+                    metrics = {
+                        "LPM/Actual_Error": actual_error,
+                        "LPM/Pred_Error": pred_error_est,
+                        "LPM/Intrinsic_Reward": intr_reward,
+                    }
+                    if is_noisy_step:
+                        metrics["LPM/Intrinsic_Reward_Noisy"] = intr_reward
+                        metrics["LPM/Actual_Error_Noisy"] = actual_error
+                    else:
+                        metrics["LPM/Intrinsic_Reward_Clean"] = intr_reward
+                        metrics["LPM/Actual_Error_Clean"] = actual_error
+                    
+                    wandb.log(metrics, step=iteration)
             else:
                 total_reward_val = reward
             
@@ -514,10 +694,10 @@ def main():
                 total_reward = []
                 total_episode += 1
                 
-                if total_episode % cfg.eval_freq == 0:
-                    evaluation(eval_env, agent, iteration, cfg)
-                    eval_env.reset()
-                    agent.reset()
+        if (iteration + 1) % cfg.eval_interval == 0:
+            evaluation(eval_env, agent, iteration, cfg)
+            eval_env.reset()
+            agent.reset()
 
         if (iteration + 1) % cfg.update_freq == 0:
             # Training
@@ -555,37 +735,31 @@ def main():
                            (1 - cfg.kl_balance) * torch.mean(kl_divergence(next_state_posterior, next_detach_prior))
                 
                 # --- Error Predictor Training ---
-                # We need to calculate Actual Error for this step i
-                # Actual Prediction Error of x_{i+1} given (z_i, h_i, a_i)
-                # We have just computed z_{i+1} and h_{i+1}.
-                # The "Predicted Obs" comes from Decoder(z_{i+1}_prior, h_{i+1})?
-                # Using Prior for strict prediction
+                # Error Predictorの学習
+                # 目的: 「次の状態での予測誤差(Actual Error)」を正しく予測できるようにする。
+                # 教師データ(Target): 実際に観測された誤差
+                # 入力(Input): z_i, h_i, a_i
                 
                 pred_next_state = next_state_prior.rsample().flatten(1) # z_{i+1} from prior
-                # Typically, we want deterministic prediction error? 
-                # Let's use mean for stability
                 pred_next_state_mean = next_state_prior.mean.flatten(1)
                 
+                # (1) モデルによる未来画像の予測
                 pred_next_obs_dist = decoder(pred_next_state_mean, rnn_hidden)
                 pred_next_obs = pred_next_obs_dist.mean.view(cfg.batch_size, 3, 64, 64)
                 
+                # (2) 実際の未来画像(observation[i+1])との比較 -> Actual Error算出
                 real_next_obs = observations[i+1] # (B, 3, 64, 64)
-                
-                # Actual Error: MSE
                 actual_error_batch = ((real_next_obs - pred_next_obs) ** 2).mean(dim=[1,2,3]) # (B,)
-                
-                # Predicted Error: ErrorPredictor(z_i, h_i, a_i)
-                # We need previous state/rnn. 
-                # At start (i=0), previous state is 'state' before update (zeros).
                 
                 if i > 0:
                     prev_state = states[i] # z_i
                     prev_rnn = rnn_hiddens[i] # h_i
                     
+                    # (3) ErrorPredictorによる予測 (Predicted Error)
                     pred_error_hat = error_predictor(prev_state.detach(), prev_rnn.detach(), actions[i]).squeeze()
                     
-                    # Loss: MSE(pred, log(actual)) or just MSE(pred, actual)?
-                    # improve.py used MSE(pred, log(actual))
+                    # (4) 損失関数の計算
+                    # ターゲットはActual Errorの対数(log)をとることで、スケールの違いを緩和することが多い
                     target = torch.log(actual_error_batch.detach() + 1e-6)
                     ep_loss += F.mse_loss(pred_error_hat, target)
                            
@@ -619,7 +793,7 @@ def main():
                     "Train/Reward_Loss": reward_loss.item(),
                     "Train/KL_Loss": kl_loss.item(),
                     "Train/EP_Loss": ep_loss.item(), # Error Predictor Loss
-                    "Train/Intr_Reward_Mean": np.mean([r[2] for r in zip(*[observations, actions, rewards])]), # Wait rewards is tensor
+                    "Train/Reward_Mean": rewards.mean().item(),
                     # Let's just log loss for now
                 }, step=iteration)
             
@@ -693,12 +867,17 @@ def main():
                 target_critic.load_state_dict(critic.state_dict())
                 
     # Save Model
-    agent.to("cpu")
-    torch.save(agent, "agent_lpm.pth")
-    print("Model saved to agent_lpm.pth")
-    
-    env.close()
-    eval_env.close()
+    try:
+        # Save Model
+        agent.to("cpu")
+        torch.save(agent, "agent_lpm.pth")
+        print("Model saved to agent_lpm.pth")
+    except Exception as e:
+        print(f"Error occurring: {e}")
+    finally:
+        print("Closing environments...")
+        env.close()
+        eval_env.close()
 
 if __name__ == "__main__":
     main()

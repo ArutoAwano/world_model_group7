@@ -25,7 +25,32 @@
   - そのため、振り子の描画画面（500x500）を **64x64ピクセルの画像** に縮小して入力しています。
 - **行動 (Action)**: 左に力をかけるか、右に力をかけるか（連続値）。
 
-### B. 妨害要素: `CIFAR-10` (Noisy-TV)
+### B. メインタスク2: `Craftium` (3D OpenWorld)
+- **目的**: 3Dボクセル世界（Minetest）での自由探索およびアイテム収集。
+- **入力情報**: 64x64ピクセルのRGB画像。
+- **行動**: 移動、ジャンプ、採掘などの計17アクション。
+- **特徴**: 無限生成される3D世界。タスク（外部報酬）が設定されていないため、好奇心のみで世界の法則を学ぶのに最適。
+
+### □ サポートされている環境一覧 (`--env-name` で指定)
+
+以下のコマンドで各タスクを実行できます。
+
+```bash
+# 基本形
+docker compose exec lpm-dreamer xvfb-run -a python3 train_lpm.py --env-name <環境名> --steps 50000 --wandb
+```
+
+| 環境名 (指定用) | 特徴・タスク内容 | 開始装備 |
+|:---|:---|:---|
+| **`Craftium`**<br>(または `Craftium/OpenWorld-v0`) | **推奨.** 無限の3D世界での自由探索（VoxeLibreベース）。<br>特定のゴールはなく、LPMによる好奇心で世界の法則を学びます。 | 素手 |
+| **`Craftium/ChopTree-v0`** | **木を切るタスク**。<br>木材を収集することを目的とします。 | 斧 (Axe) |
+| **`Craftium/Speleo-v0`** | **洞窟探検タスク**。<br>地下空間を探索します。 | - |
+| **`Craftium/SpidersAttack-v0`** | **戦闘タスク (vs クモ)**。<br>次々と現れる敵（クモ）を倒して生き残ります。 | 剣 (Sword) |
+| **`Craftium/ProcDungeons-v0`** | **ダンジョン攻略タスク**。<br>自動生成されるダンジョンを探索し、敵を倒しながら奥へ進みます。 | 剣 (Sword) |
+| `MountainCarContinuous-v0` | 谷を登る制御タスク。連続アクションのテスト用。 | - |
+| `Pendulum-v1` | デフォルト。軽量な振り子タスク。 | - |
+
+### C. 妨害要素: `CIFAR-10` (Noisy-TV)
 - 探索能力を試すために、わざと**「魅力的なノイズ (Noisy-TV)」** を混ぜています。
 - エージェントが特定の行動（激しく動くなど）をすると、画面が突然 **CIFAR-10データセットの画像（飛行機、鳥、猫などの写真）** に切り替わります。
 - **なぜこれをするの？**:
@@ -61,28 +86,28 @@ Dreamerの各パーツ（世界モデルやポリシーなど）が定義され�
 
 ```mermaid
 graph TD
-    subgraph Environment [環境 (Noisy-TV)]
-        Obs[観測画像 (Obs)]
-        Reward_Ext[外的報酬 (Reward)]
+    subgraph Environment ["環境 (Noisy-TV)"]
+        Obs["観測画像 (Obs)"]
+        Reward_Ext["外的報酬 (Reward)"]
     end
 
-    subgraph Dreamer_Agent [Dreamer エージェント]
-        Encoder[Encoder (目)]
+    subgraph Dreamer_Agent ["Dreamer エージェント"]
+        Encoder["Encoder (目)"]
         
-        subgraph World_Model [世界モデル (脳)]
-            RSSM[RSSM (記憶・予測)]
-            Decoder[Decoder (想像)]
-            RewardModel[Reward Model (報酬予測)]
+        subgraph World_Model ["世界モデル (脳)"]
+            RSSM["RSSM (記憶・予測)"]
+            Decoder["Decoder (想像)"]
+            RewardModel["Reward Model (報酬予測)"]
         end
         
-        subgraph Policy [行動決定]
-            Actor[Actor (行動する人)]
-            Critic[Critic (評価する人)]
+        subgraph Policy ["行動決定"]
+            Actor["Actor (行動する人)"]
+            Critic["Critic (評価する人)"]
         end
         
-        subgraph LPM_Module [LPM (好奇心)]
-            ErrorPredictor[Error Predictor (自信の予測)]
-            Calc_Intr[好奇心報酬の計算]
+        subgraph LPM_Module ["LPM (好奇心)"]
+            ErrorPredictor["Error Predictor (自信の予測)"]
+            Calc_Intr["好奇心報酬の計算"]
         end
     end
 
@@ -145,13 +170,68 @@ graph TD
     *   この差分が大きい（＝思ったよりうまく予測できた、あるいは学習効果が高かった）場合に、大きな報酬を与えます。
     *   **Noisy-TV対策**: 完全ランダムな映像は「実際に外れる」かつ「事前にも外れるとわかる」ため、差分が小さくなり、報酬が発生しにくくなります。
 
-## 4. 実行方法 (How to Run)
+## 4. 学習プロセス (Training Process)
+
+エージェントは、以下の3つのコンポーネントを **同じ学習ループ内で同時に学習** させ、常に自己改善（メタ学習）を繰り返します。
+
+### A. 学習のステップ
+1.  **環境とのインタラクション (Interaction)**
+    *   エージェントが行動 (`env.step`) し、結果 (`next_obs`, `reward`) を得ます。
+    *   このとき、LPMモジュールが「予測誤差」を計算し、**内的報酬 (Intrinsic Reward)** を環境報酬に加算します。
+    *   データは `ReplayBuffer` に蓄積されます。
+
+2.  **世界モデル & LPM の学習 (World Model & ErrorPredictor Update)**
+    *   **世界モデル (RSSM & Decoder)**: 過去の画像系列を正しく復元・予測できるように学習します (`Obs_Loss`, `KL_Loss`)。
+    *   **LPM (ErrorPredictor)**: 「次の瞬間の予測誤差」を正しく予測できるように学習します (`EP_Loss`)。
+    *   これらは `wm_optimizer` によって一括で更新されます。これにより、世界モデルの成長に合わせて「好奇心の基準」もリアルタイムで更新されます。
+
+3.  **行動決定器の学習 (Actor-Critic Update)**
+    *   **Imagination (夢を見る)**: 学習した世界モデルを使って、頭の中で未来をシミュレーションします。
+    *   **Actor (行動)**: シミュレーション上で **「環境報酬 + 好奇心報酬」** の合計が最大になるような行動を学習します。
+    *   **Critic (価値判定制)**: その合計報酬の期待値を精度よく予測するように学習します。
+
+### B. 学習のモニタリング (Monitoring)
+
+WandB等で以下の指標を確認することで、各パートが正しく動いているか判断できます。
+
+#### 1. 各指標の意味 (Metrics Definitions)
+
+| 指標名 | 意味・解釈 |
+|:---|:---|
+| **`Train/WM_Loss`** | **世界モデルの「わからなさ」**。<br>観測損失 (`Obs`) + KL損失 (`KL`) + 報酬損失 (`Reward`) の合計。これが下がれば、モデルが世界を正しく理解しつつあります。 |
+| **`Train/Obs_Loss`** | **画像の再構成誤差**。<br>「今見ているもの」を脳内でどれだけ正確に再現できるか。Dreamerの「視力」や「想像力」に相当します。 |
+| **`Train/KL_Loss`** | **「予測」と「現実」のギャップ**。<br>これが低いと、過去の記憶だけで未来を正確に予測できています。 |
+| **`Train/EP_Loss`** | **「自分の実力の見積もり」の失敗度合い**。<br>誤差予測器(EP)が「次はこれくらい予測を外すだろう」と予想した値と、実際の失敗量のズレ。 |
+| **`LPM/Intrinsic_Reward`** | **好奇心報酬** (`Pred_Error(対数) - Actual_Error(対数)`)。<br>「思ったより上手くできた（予測誤差が小さかった）」ときにプラスになります。 |
+| **`LPM/Actual_Error`** | **実際の予測失敗量**。<br>世界モデルがどれくらい未来予測を間違えたか。**これが下がることが学習の第一目標です**。 |
+
+#### 2. LPMの学習サイクル: 「習熟の喜び」と「退屈」
+
+LPMの特徴的な挙動として、報酬が一時的に高止まりし、その後に下がる現象が見られます。これはバグではなく、正常な学習プロセスです。
+
+1.  **習熟への喜び (Joy of Mastery)**
+    *   **現象**: 世界モデル (WM) が急に賢くなり、予測誤差 (`Actual`) がドンと下がる。しかし、誤差予測器 (EP) はまだ「難しいはずだ」と思っているため、大きなプラスの報酬が発生する (`Pred > Actual`)。
+    *   **効果**: エージェントは「ここは急に予測できるようになった！楽しい！」と感じ、**しばらくその場所に留まって学習を定着させようとします**。
+
+2.  **退屈 (Boredom)**
+    *   **現象**: 同じ場所に留まっていると、遅れて学習していた EP がやがて追いつき、「ここはもう簡単だ」と正確に見積もれるようになる。すると報酬 (`Pred - Actual`) がゼロに近づく。
+    *   **効果**: エージェントは「ここはもう完全に理解した（飽きた）」と感じ、**新しい未知の場所へと移動を開始します**。
+
+> [!NOTE]
+> 誤差予測器 (EP) の学習が遅れることは意図的な設計です。EPが速すぎると、理解が定着する前に「飽きた」と判断してしまい、浅い学習になってしまうためです。
 
 ターミナルで以下のコマンドを実行してください。
 
 ```bash
-# 基本的な実行 (10,000ステップ学習し、Noisy-TV環境を使用)
+# Pendulum (標準)
 python3 train_lpm.py --steps 10000 --noisy-tv
+
+# Craftium (3D世界探索 - 推奨)
+# ※Xvfb環境下で実行してください
+xvfb-run -a python3 train_lpm.py --env-name Craftium --steps 50000
+
+# 別のサンプル環境
+python3 train_lpm.py --env-name MountainCarContinuous-v0 --steps 20000 --noisy-tv
 ```
 
 ### 主なオプション引数
@@ -167,7 +247,14 @@ python3 train_lpm.py --steps 10000 --noisy-tv
 - **保存場所**: `videos/` ディレクトリ
 - **ファイル名**: `eval_iter_{step}_ep_0.mp4` (ステップ数ごとの動画)
 
-### 実験管理 (Weights & Biases)
+### 実験のポイント (Tips)
+
+#### なぜ LPM なのか？
+LPMがない（ただの予測誤差やランダム探索）場合、エージェントはNoisy-TV（ランダム画像）に引っかかり続けます。
+LPMがあると、「Noisy-TVは予測できないけれど、学習しても予測できるようにならない（進歩がない）」と気づき、飽きて（Learning Progressが低下して）別の行動（棒を立てるなど）に移ります。
+
+Logsを確認する際は、`Train/EP_Loss` (ErrorPredictorの精度) や `Train/Intr_Reward_Mean` (好奇心報酬の量) に注目してください。
+Noisy-TVを見ているときは Intr_Reward が最初は高いかもしれませんが、すぐに下がっていくはずです。
 学習曲線（報酬の推移など）をグラフで見たい場合は、WandBを使用できます。
 
 ```bash
@@ -176,7 +263,46 @@ python3 train_lpm.py --steps 10000 --noisy-tv --wandb --wandb-project "Dreamer-L
 ```
 - 初回実行時にAPIキーの入力が求められます（または `export WANDB_API_KEY=your_key` で設定）。
 
-## 5. Dockerでの実行方法 (Run with Docker)
+- 初回実行時にAPIキーの入力が求められます（または `export WANDB_API_KEY=your_key` で設定）。
+
+## 5. 検証と可視化 (Verification & Visualization)
+
+LPMが正しく機能しているか（＝ノイズを無視できているか）を確認するためのツールを用意しました。
+
+### ステップ 1: Noisy-TV環境で学習を実行
+まず、ノイズがある環境でデータを収集します。
+
+```bash
+python3 train_lpm.py --steps 5000 --noisy-tv
+```
+
+実行すると、学習ログが `lpm_stats.csv` というファイルに自動的に保存されます。
+このファイルには、「実際の予測誤差」「ErrorPredictorの予測値」「内発的報酬」「ノイズの有無」が記録されています。
+
+### ステップ 2: グラフを作成
+付属のスクリプトを実行して、可視化グラフを生成します。
+
+```bash
+python3 plot_lpm_analysis.py
+```
+
+`plots/` ディレクトリに以下の画像が生成されます：
+
+1.  **`reward_over_time.png` (報酬の推移)**
+    - **Noisy State Reward (赤)**: ノイズ画像に対する内発的報酬。
+    - **Clean State Reward (青)**: 通常画像に対する内発的報酬。
+    - **理想的な動き**: 学習が進むにつれて、「赤線（ノイズ）」が下がり、「青線」より低くなる、あるいはゼロに近づくはずです。これは「ノイズは予測できないし、学習しても無駄だ」とエージェントが理解したことを意味します。
+
+2.  **`error_correlation.png` (誤差の相関)**
+    - 横軸：実際の予測誤差 (Actual Error)
+    - 縦軸：予測した誤差 (Predicted Error)
+    - ErrorPredictorが正しく学習できていれば、点が対角線（点線）に沿って並びます。
+
+3.  **`error_distribution.png` (誤差分布)**
+    - ノイズ画像と通常画像の、実際の予測誤差のヒストグラムです。
+    - ノイズ画像のほうが圧倒的に誤差が大きい（右側に分布する）ことが確認できます。
+
+## 6. Dockerでの実行方法 (Run with Docker)
 
 他のマシンでも同じ環境で実行できるように、Docker環境を用意しました。
 
@@ -204,7 +330,7 @@ python3 train_lpm.py --steps 10000 --noisy-tv --wandb --wandb-project "Dreamer-L
 3. **終了方法**
    `exit` でコンテナから抜けられます。コンテナ自体を停止するには `docker-compose down` を実行してください。
 
-## 6. ファイル構成仕様書 (File Specifications)
+## 7. ファイル構成仕様書 (File Specifications)
 
 開発者が変更を加える際のガイドです。「何を変えたい時に、どのファイルをどうすればいいか」をまとめています。
 
@@ -213,6 +339,11 @@ python3 train_lpm.py --steps 10000 --noisy-tv --wandb --wandb-project "Dreamer-L
 | **`train_lpm.py`** | **学習実行スクリプト**<br>(練習メニュー) | ・学習の回数、バッチサイズ<br>・使用する環境 (Pendulumなど)<br>・報酬計算式 (LPMの係数ηなど)<br>・WandBのログ設定 | `python3 train_lpm.py` |
 | **`student_code.py`** | **モデル定義**<br>(脳みそ・身体) | ・ニューラルネットの構造 (層の数、広さ)<br>・世界モデル(RSSM)の挙動<br>・好奇心(ErrorPredictor)の予測ロジック | 直接実行はしない<br>(importされる) |
 | **`exploration/`** | **補助ツール** | ・Noisy-TVの画像生成ロジック (`cifar.py`)<br>・環境のラッパー (`noisy_wrapper.py`) | (importされる) |
+| **`Dockerfile`** | **環境定義** | ・インストールされるライブラリ<br>・Pythonのバージョン | `docker build` |
+| **`train_lpm.py`** | **学習実行スクリプト**<br>(練習メニュー) | ・学習の回数、バッチサイズ<br>・使用する環境 (Pendulumなど)<br>・報酬計算式 (LPMの係数ηなど)<br>・WandBのログ設定 | `python3 train_lpm.py` |
+| **`student_code.py`** | **モデル定義**<br>(脳みそ・身体) | ・ニューラルネットの構造 (層の数、広さ)<br>・世界モデル(RSSM)の挙動<br>・好奇心(ErrorPredictor)の予測ロジック | 直接実行はしない<br>(importされる) |
+| **`exploration/`** | **補助ツール** | ・Noisy-TVの画像生成ロジック (`cifar.py`)<br>・環境のラッパー (`noisy_wrapper.py`) | (importされる) |
+| **`plot_lpm_analysis.py`**| **可視化ツール** | ・`lpm_stats.csv` を読み込んでグラフを描画する | `python3 plot_lpm_analysis.py` |
 | **`Dockerfile`** | **環境定義** | ・インストールされるライブラリ<br>・Pythonのバージョン | `docker build` |
 | **`start.sh`** | **起動スクリプト** | ・Docker起動時のオプション<br>・マウントするフォルダ設定 | `./start.sh` |
 

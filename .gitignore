@@ -5,3 +5,7 @@ LPM_exploration/exploration/__pycache__/
 LPM_exploration/__pycache__
 LPM_exploration/data
 LPM_exploration/videos
+LPM_exploration/minetest-*/
+LPM_exploration/minetest-run-*/locale
+LPM_exploration/wandb
+*.pth

@@ -8,6 +8,28 @@ RUN apt-get update && apt-get install -y \
     libxext6 \
     libxrender-dev \
     git \
+    g++ \
+    make \
+    cmake \
+    build-essential \
+    libjpeg8-dev \
+    libpng-dev \
+    zlib1g-dev \
+    libopengl-dev \
+    libglx-dev \
+    libgl1-mesa-dev \
+    libx11-dev \
+    libxxf86vm-dev \
+    libvorbis-dev \
+    libopenal-dev \
+    libsqlite3-dev \
+    libzstd-dev \
+    libluajit-5.1-dev \
+    libjsoncpp-dev \
+    libgmp-dev \
+    libcurl4-gnutls-dev \
+    libfreetype6-dev \
+    xvfb \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
