@@ -640,7 +640,7 @@ class Agent(nn.Module):
             state_prior = self.rssm.get_prior(self.rnn_hidden)
             state_pred = state_prior.sample().flatten(1)
             obs_dist = self.decoder(state_pred, self.rnn_hidden)
-            obs_pred_img = obs_dist.sample()
+            obs_pred_img = obs_dist.mean
 
             # 3. 状態認識 (State Estimation) - 「現実を見る」
             # 実際の観測画像(obs)を使って、世界モデルの認識(Posterior)を更新します。

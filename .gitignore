@@ -9,3 +9,4 @@ LPM_exploration/minetest-*/
 LPM_exploration/minetest-run-*/locale
 LPM_exploration/wandb
 *.pth
+LPM_exploration/eval_view

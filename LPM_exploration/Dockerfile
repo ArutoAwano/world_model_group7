@@ -30,6 +30,11 @@ RUN apt-get update && apt-get install -y \
     libcurl4-gnutls-dev \
     libfreetype6-dev \
     xvfb \
+    libc6-dev \
+    libogg-dev \
+    gettext \
+    libsdl2-dev \
+    libpython3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
@@ -50,7 +55,19 @@ RUN pip install --no-cache-dir \
     opencv-python \
     matplotlib \
     tqdm \
+    gymnasium[atari] \
+    gymnasium[accept-rom-license] \
+    "gymnasium>=1.0.0" \
     pillow
+
+# Install Craftium
+COPY craftium_repo /opt/craftium_repo
+RUN rm -f /opt/craftium_repo/CMakeCache.txt && \
+    rm -rf /opt/craftium_repo/CMakeFiles && \
+    pip uninstall -y cmake && \
+    pip install -U setuptools && \
+    pip install /opt/craftium_repo && \
+    pip install "gymnasium>=1.0.0"
 
 # Set environment variables for non-interactive rendering if needed
 ENV MUJOCO_GL=egl

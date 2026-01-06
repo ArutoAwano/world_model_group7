@@ -12,6 +12,7 @@ import torch.optim as optim
 from torch.distributions import Normal, OneHotCategoricalStraightThrough
 from torch.distributions.kl import kl_divergence
 from torch.nn.utils import clip_grad_norm_
+from tqdm import tqdm
 
 # Import from student_code and exploration
 from student_code import Agent, RSSM, Encoder, Decoder, RewardModel, DiscountModel, Actor, DiscreteActor, Critic, ErrorPredictor, MSE
@@ -122,7 +123,7 @@ class Config:
         # learning period settings
         self.iter = 6000
         self.seed_iter = 1000 # Reduced for faster start in dev
-        self.eval_interval = 200
+        self.eval_interval = 800
         self.eval_freq = 5
         self.eval_episodes = 5
         
@@ -207,6 +208,11 @@ def set_seed(seed: int):
 def evaluation(eval_env, policy, step, cfg):
     env = eval_env
     all_ep_rewards = []
+    
+    # Ensure directories exist
+    os.makedirs("eval_view/video", exist_ok=True)
+    os.makedirs("eval_view/images", exist_ok=True)
+    
     with torch.no_grad():
         for i in range(cfg.eval_episodes):
             obs = env.reset()
@@ -216,9 +222,13 @@ def evaluation(eval_env, policy, step, cfg):
             truncated = False
             episode_reward = []
             frames = [] 
+            recon_frames = []
             
             while not done and not truncated:
-                action, _ = policy(obs, eval=True)
+                # Agent returns (action, recon_img)
+                # recon_img is (64, 64, 3) range 0-1
+                action, recon_img = policy(obs, eval=True)
+                
                 # Convert action to one-hot index if needed, but here simple env
                 if isinstance(env.action_space, gym.spaces.Box):
                     # Clip action to space?
@@ -231,23 +241,58 @@ def evaluation(eval_env, policy, step, cfg):
                 else:
                     obs, reward, done, truncated, info = env.step(action)
                 
-                # Render for video
+                # Render for video (Real observation)
                 frame = env.render() 
                 frames.append(frame)
                 
+                # Reconstructed frame
+                if recon_img is not None:
+                    # recon_img is 0-1 float. Convert to 0-255 uint8
+                    recon_frame = (recon_img * 255.0).astype(np.uint8)
+                    recon_frames.append(recon_frame)
+                
                 episode_reward.append(reward)
             
-            # Save video for the first episode of evaluation
+            # Save video and images for the first episode of evaluation
             if i == 0 and len(frames) > 0:
-                video_path = f"videos/eval_iter_{step}_ep_{i}.mp4"
+                # Save Video (Side by Side if possible, or separate)
+                video_path = f"eval_view/video/eval_iter_{step}_ep_{i}.mp4"
                 try:
                      # Ensure frames are uint8 numpy arrays
                      frames = [np.array(f, dtype=np.uint8) for f in frames if f is not None]
-                     if len(frames) > 0:
+                     
+                     if len(recon_frames) > 0 and len(recon_frames) == len(frames):
+                         # Create side-by-side video
+                         # Resize frames to match if needed (env.render might be larger than 64x64)
+                         # recon is 64x64. frame depends on env.
+                         
+                         combined_frames = []
+                         for f, r in zip(frames, recon_frames):
+                             # Resize f to match r (64x64) for simple concatenation
+                             f_pil = Image.fromarray(f)
+                             r_pil = Image.fromarray(r)
+                             
+                             f_s = f_pil.resize((64, 64))
+                             
+                             # Concatenate horizontally
+                             comb = Image.new('RGB', (128, 64))
+                             comb.paste(f_s, (0, 0))
+                             comb.paste(r_pil, (64, 0))
+                             combined_frames.append(np.array(comb))
+                             
+                         imageio.mimsave(video_path, combined_frames, fps=30)
+                         print(f"Saved combined video to {video_path}")
+                     else:
                         imageio.mimsave(video_path, frames, fps=30)
                         print(f"Saved video to {video_path}")
-                     else:
-                        print("No valid frames to save.")
+
+                     # Save Snapshot Images (Start, Middle, End)
+                     if len(combined_frames) > 0:
+                         indices = [0, len(combined_frames)//2, len(combined_frames)-1]
+                         for idx in indices:
+                             img_path = f"eval_view/images/eval_iter_{step}_ep_{i}_frame_{idx}.png"
+                             Image.fromarray(combined_frames[idx]).save(img_path)
+
                 except Exception as e:
                      print(f"Failed to save video: {e}")
 
@@ -414,15 +459,33 @@ def main():
         elif env_name == "MNIST":
             env = MnistEnv()
             trigger_prob = 0.1
-        elif "ALE/" in env_name or "NoFrameskip" in env_name:
+        elif "ALE/" in env_name or "NoFrameskip" in env_name or "Breakout" in env_name:
+            import ale_py
+            gym.register_envs(ale_py) # Just in case, or just importing is enough usually
+            
             # Atari Environment Handling
-            env = gym.make(env_name, render_mode="rgb_array")
-            if SB3_AVAILABLE:
-                env = NoopResetEnv(env, noop_max=30)
-                env = MaxAndSkipEnv(env, skip=4)
-                # Common Atari Wrappers
-                # WarpFrame resizes to 84x84 grayscale, we might need 64x64 RGB
-                # So we might skip WarpFrame if we use ResizeObservation later
+            # Use 'ALE/Breakout-v5' or similar. 
+            # We use AtariPreprocessing for standard behavior (FrameSkip, Resize, etc.)
+            env = gym.make(env_name, render_mode="rgb_array", frameskip=1) # frameskip handled by wrapper
+            
+            from gymnasium.wrappers import AtariPreprocessing, TransformReward
+            
+            # AtariPreprocessing handles:
+            # - NoopReset
+            # - FrameSkip (default 4)
+            # - Resize (default 84x84 -> we can set 64x64 or resize later)
+            # - Grayscale (default True)
+            # - Scale (default False)
+            
+            # We want 64x64 RGB for consistency with Dreamer existing config
+            env = AtariPreprocessing(env, noop_max=30, frame_skip=4, screen_size=64, terminal_on_life_loss=False, grayscale_obs=False, scale_obs=False)
+            
+            # If grayscale_obs=True, outputis (64, 64). We need (64, 64, 3) or (H, W, 3).
+            # If grayscale_obs=False, output is (64, 64, 3).
+            
+            # Clip rewards for stability
+            env = TransformReward(env, lambda r: np.sign(r))
+            
             trigger_prob = 0.01
         else:
              try:
@@ -441,7 +504,7 @@ def main():
             # Ensure RGB
             # (Some Atari envs or wrappers might output grayscale, checking shape might be needed)
         
-        if env_name != "Crafter":
+        if env_name != "Crafter" and "ALE/" not in env_name and "NoFrameskip" not in env_name and "Breakout" not in env_name:
              env = RenderWrapper(env)
 
         if noisy:
@@ -550,7 +613,10 @@ def main():
 
     # Main Loop
     print("Starting Main Loop...")
-    for iteration in range(cfg.iter):
+    
+    # Progress Bar Wrapper
+    pbar = tqdm(range(cfg.iter), desc="Training Steps", unit="step")
+    for iteration in pbar:
         
         # Interaction with LPM Reward Calculation
         with torch.no_grad():
@@ -695,9 +761,22 @@ def main():
                 total_episode += 1
                 
         if (iteration + 1) % cfg.eval_interval == 0:
-            evaluation(eval_env, agent, iteration, cfg)
-            eval_env.reset()
-            agent.reset()
+            try:
+                evaluation(eval_env, agent, iteration, cfg)
+                eval_env.reset()
+                agent.reset()
+            except Exception as e:
+                print(f"Evaluation failed at iteration {iteration}: {e}")
+                print("Re-creating evaluation environment...")
+                try:
+                    eval_env.close()
+                except:
+                    pass
+                try:
+                    eval_env = make_env_simple(args.seed + 100 + iteration, args.env_name, args.noisy_tv)
+                    print("Evaluation environment re-created successfully.")
+                except Exception as create_e:
+                    print(f"Failed to re-create evaluation environment: {create_e}")
 
         if (iteration + 1) % cfg.update_freq == 0:
             # Training
@@ -796,6 +875,12 @@ def main():
                     "Train/Reward_Mean": rewards.mean().item(),
                     # Let's just log loss for now
                 }, step=iteration)
+
+            # Update progress bar description
+            pbar.set_postfix({
+                 "total_r": f"{np.mean(total_reward[-10:]):.1f}" if total_reward else "0.0",
+                 "wm_loss": f"{wm_loss.item():.2f}"
+            })
             
             # --- Actor Critic Update ---
             flatten_rnn_hiddens = flatten_rnn_hiddens.detach()
