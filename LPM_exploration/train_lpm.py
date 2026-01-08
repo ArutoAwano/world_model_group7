@@ -20,7 +20,10 @@ from exploration.noisy_wrapper import NoisyTVEnvWrapperCIFAR
 from exploration.cifar import create_cifar_function_simple
 import gymnasium as gym
 import imageio
-import craftium
+try:
+    import craftium
+except ImportError:
+    craftium = None
 from PIL import Image
 import wandb
 from torchvision import datasets, transforms
@@ -93,7 +96,7 @@ class Config:
         self.buffer_size = 100_000
         self.batch_size = 16
         self.seq_length = 50
-        self.imagination_horizon = 10
+        self.imagination_horizon = 20
 
         # model dimensions
         self.state_dim = 32
@@ -123,7 +126,7 @@ class Config:
         # learning period settings
         self.iter = 6000
         self.seed_iter = 1000 # Reduced for faster start in dev
-        self.eval_interval = 800
+        self.eval_interval = 150000
         self.eval_freq = 5
         self.eval_episodes = 5
         

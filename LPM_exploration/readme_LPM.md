@@ -101,6 +101,19 @@ docker run --gpus all -it --rm -v $(pwd):/workspace worldmodel-competition3 \
   python train_lpm.py --env-name ALE/Breakout-v5 --steps 50000 --wandb
 ```
 
+### Google Colab での実行について (New)
+
+Docker環境を使用せず、Google Colab上で `train_lpm.py` を実行するためのノートブックを用意しました。
+
+**使用ファイル:** `LPM_exploration/Run_LPM_on_Colab.ipynb`
+
+**手順:**
+1.  `LPM_exploration` フォルダ一式を Google Drive にアップロードしてください。（訓練スクリプト `train_lpm.py` などが含まれています）
+2.  `Run_LPM_on_Colab.ipynb` を Colab で開きます。
+3.  ノートブック内の指示に従い、環境構築セルを実行してください（Craftiumは自動的にGitHubからクローンされます）。
+4.  WandB のログインを行い、トレーニングを開始します。
+
+
 ### 変更点と機能
 
 #### 1. 依存関係の更新 (Dockerfile)
