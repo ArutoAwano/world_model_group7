@@ -58,6 +58,8 @@ RUN pip install --no-cache-dir \
     gymnasium[atari] \
     gymnasium[accept-rom-license] \
     "gymnasium>=1.0.0" \
+    ale-py \
+    shimmy \
     pillow
 
 # Install Craftium

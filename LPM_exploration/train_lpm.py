@@ -126,13 +126,18 @@ class Config:
         # learning period settings
         self.iter = 6000
         self.seed_iter = 1000 # Reduced for faster start in dev
-        self.eval_interval = 150000
+        self.eval_interval = 20000
         self.eval_freq = 5
         self.eval_episodes = 5
         
         # LPM Params
         self.lpm_eta = 1.0
         self.lpm_lr = 2e-4
+        
+        # LPM Params
+        self.lpm_eta = 1.0
+        self.lpm_lr = 2e-4
+        self.use_lpm = False
         
         # Override with kwargs
         for k, v in kwargs.items():
@@ -322,10 +327,14 @@ def main():
     parser.add_argument('--wandb-project', default='Dreamer-LPM', help='WandB project name')
     parser.add_argument('--wandb-entity', default=None, help='WandB entity')
     parser.add_argument('--wandb-run-name', default=None, help='Run name')
+    parser.add_argument('--enable-lpm', action='store_true', help='Enable LPM intrinsic reward')
+    parser.add_argument('--seed-steps', type=int, default=1000, help='Number of seed steps')
     args = parser.parse_args()
     
     cfg = Config()
     cfg.iter = args.steps
+    cfg.use_lpm = args.enable_lpm
+    cfg.seed_iter = args.seed_steps
     
     # Initialize WandB
     if args.wandb:
@@ -498,7 +507,7 @@ def main():
                 env = gym.make("Pendulum-v1", render_mode="rgb_array")
         
         # Common Wrappers
-        if env_name != "Crafter" and not isinstance(env, MnistEnv):
+        if env_name != "Crafter":
             # MnistEnv already outputs 64x64x3
             # Ensure we resize to 64x64 for Dreamer
             from gymnasium.wrappers import ResizeObservation
@@ -513,10 +522,13 @@ def main():
         if noisy:
              get_cifar = create_cifar_function_simple()
              if isinstance(env.action_space, gym.spaces.Box):
-                 if trigger_thresh is None: trigger_thresh = 0.0 # Default
-                 env = NoisyTVWrapperContinuous(env, get_cifar, trigger_threshold=trigger_thresh)
+                 # NoisyTVEnvWrapperCIFAR is designed for Discrete action spaces (augmenting with new actions)
+                 # For continuous, we might need a different approach or just fallback/skip for now as requested by user focus on Atari
+                 print("Warning: NoisyTVEnvWrapperCIFAR not supported for Continuous Env (Pendulum etc). Skipping wrapper.")
              else:
-                 env = NoisyTVWrapperDiscrete(env, get_cifar, trigger_prob=trigger_prob)
+                 # Use correct wrapper from exploration.noisy_wrapper
+                 # It expands action space by num_random_actions
+                 env = NoisyTVEnvWrapperCIFAR(env, get_cifar, num_random_actions=1)
         return env
 
     env = make_env_simple(args.seed, args.env_name, args.noisy_tv)
@@ -694,21 +706,36 @@ def main():
                 pred_error_est = error_predictor(t_last_state, t_last_rnn, t_action).item()
                 
                 # 3. 好奇心報酬 (Intrinsic Reward)
-                # 「予測誤差が大きい(難しい)」かつ「それが予想通り(予測可能)」なら報酬は小。
-                # 「予測誤差が大きい(難しい)」のに「予想では小さいと思っていた(未知の発見)」なら報酬は大...ではない。
-                # LPMの定義: 
-                # 原論文(Oudeyer et al.): Learning Progress = Error(t-1) - Error(t) (誤差の減少量)
-                # この実装: (Predicted Error - Actual Error)
-                #  差分が大きい = 「思っていたより誤差が小さかった」= 「学習が進んだ/上手くできた」場合などに正の報酬？
-                #  逆に、Noisy-TVのようなランダムなものは、常にActual Errorが大きく、Predicted Errorもそれに追従して大きくなるため、
-                #  差分（学習の進捗）はゼロに近づく、というロジック。
+                # Refactored Logic based on Peer Review:
+                # "LPM should reflect the IMPROVEMENT in prediction (Error(t-1) - Error(t)) or 
+                #  at least the 'Learning Progress' which is the reduction in error."
+                #
+                # Current Implementation (Surprise-based proxy):
+                # We reward when Actual Error is LOWER than Predicted Error.
+                # If ErrorPredictor estimates "High Error" (Novelty/Difficulty) but Actual Error is "Low" (Mastered/Learned),
+                # that difference implies we "Learned" it (Progress).
+                #
+                # intr_reward = eta * (Predicted_Error - Actual_Error)
+                # If Actual < Predicted => Reward > 0 (Surprising Success / Progress)
+                # If Actual > Predicted => Reward < 0 (Unexpected Failure / Noise?)
+                #
+                # Note: Noisy-TV (random noise) is inherently Unpredictable (High Actual Error).
+                # The Error Predictor will eventually learn to predict "High Error" for Noisy TV.
+                # Thus (Predicted (High) - Actual (High)) ~= 0.
+                # This helps avoiding Noisy-TV trap.
                 
                 # Fix: Error Predictor predicts Log(MSE), so we must compare with Log(Actual MSE)
                 actual_error_log = np.log(actual_error + 1e-6)
-                intr_reward = cfg.lpm_eta * (pred_error_est - actual_error_log)
                 
-                # 安定化のためのクリッピング
-                intr_reward = max(-1.0, min(1.0, intr_reward))
+                intr_reward = 0.0
+                if cfg.use_lpm:
+                    # Logic: Reward = Expected_Error - Actual_Error
+                    # If we expected a large error (difficulty) but got a small one (understanding), 
+                    # that represents learning progress (or at least "Surprise" in a good way).
+                    intr_reward = cfg.lpm_eta * (pred_error_est - actual_error_log)
+                    
+                    # 安定化のためのクリッピング
+                    intr_reward = max(-1.0, min(1.0, intr_reward))
                 
                 total_reward_val = reward + intr_reward
                 
