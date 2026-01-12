@@ -1,0 +1,12 @@
+LPM_exploration/data/cifar-10-batches-py/test_batch
+LPM_exploration/agent_lpm.pth
+LPM_exploration/data/cifar-10-python.tar.gz
+LPM_exploration/exploration/__pycache__/
+LPM_exploration/__pycache__
+LPM_exploration/data
+LPM_exploration/videos
+LPM_exploration/minetest-*/
+LPM_exploration/minetest-run-*/locale
+LPM_exploration/wandb
+*.pth
+LPM_exploration/eval_view
