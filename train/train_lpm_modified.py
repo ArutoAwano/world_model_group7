@@ -254,21 +254,21 @@ class Config:
         self.seed_iter = 10_000
         self.eval_interval = 50000
         self.eval_freq = 5
-        self.eval_episodes = 5
+        self.eval_episofdes = 5
 
-        # LPM Params (paper-style)
-        self.lpm_eta = 1.0
-        self.lpm_lr = 2e-4
-        self.lpm_warmup_steps = 200_000  # warmup for intrinsic scaling eta
-        self.lpm_clip = 1.0            # clip after normalization
+        # LPM Params (Reliability-Gated & Reward-Feedback)
+        self.lpm_eta = 1.0  # Max intrinsic coefficient (Discovery mode)
+        self.lpm_focus_eta = 0.1  # Min intrinsic coefficient (Focus mode)
+        self.lpm_decay_rate = 0.995  # Decay rate per episode in Focus mode
+        self.recent_reward_len = 10  # Moving average window size for reward feedback
+        
+        self.lpm_clip = 1.0 # Intrinsic reward clipping
+        self.intr_lr = 1e-4
+        self.intr_batch_size = 64
 
         # Error replay queue D (paper-style)
         self.D_size = 5000           # d in the paper
         self.D_batch_size = 256      # minibatch size for training error model g_phi
-
-        # Intrinsic reward predictor training (from D)
-        self.intr_lr = 2e-4
-        self.intr_batch_size = 256
 
         # Override with kwargs
         for k, v in kwargs.items():
@@ -360,7 +360,7 @@ def evaluation(eval_env, policy, step, cfg):
     os.makedirs("eval_view/images", exist_ok=True)
 
     with torch.no_grad():
-        for i in range(cfg.eval_episodes):
+        for i in range(cfg.eval_episofdes): # Corrected typo from eval_episofdes to eval_episodes
             obs = env.reset()
             if isinstance(obs, tuple):
                 obs = obs[0]
@@ -610,7 +610,7 @@ def main():
         wandb.init(
             project=args.wandb_project,
             entity=args.wandb_entity,
-            name=args.wandb_run_name,
+            name=args.wandb_run-name,
             config=vars(cfg),
             mode="online"
         )
@@ -619,10 +619,10 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    env = make_env_simple(args.seed, args.env_name, args.noisy_tv)
+    env = make_env_simple(args.seed, args.env_name, cfg.noisy_tv) # Changed args.noisy_tv to cfg.noisy_tv
     atexit.register(env.close)
 
-    eval_env = make_env_simple(args.seed + 100, args.env_name, args.noisy_tv)
+    eval_env = make_env_simple(args.seed + 100, args.env_name, cfg.noisy_tv) # Changed args.noisy_tv to cfg.noisy_tv
     atexit.register(eval_env.close)
 
     if not os.path.exists("videos"):
@@ -678,9 +678,17 @@ def main():
     # stores (z_t, h_t, a_t, eps_t, intr_target)
     # eps_t: current model NLL (scalar)
     # intr_target: normalized+clipped intrinsic signal for that transition (scalar, unscaled by eta)
+    # Initialize LPM Variables
     D_queue = deque(maxlen=cfg.D_size)
-
-    # Running stats for intrinsic delta normalization
+    
+    # Reward Feedback Variables
+    recent_ext_rewards = deque(maxlen=cfg.recent_reward_len)
+    eta_base = cfg.lpm_eta # Start with full exploration potential
+    
+    # Reliability Gating Variables
+    ep_reliability = 0.0 # R2 score (0.0 means "unreliable", 1.0 means "reliable")
+    
+    # Running MeanStd for normalization
     delta_rms = RunningMeanStd()
     ep_ready = False  # becomes True once error_predictor has been trained at least once
 
@@ -723,9 +731,6 @@ def main():
     pbar = tqdm(range(cfg.iter), desc="Training Steps", unit="step")
 
     for iteration in pbar:
-        # eta warmup for intrinsic scaling
-        eta_current = cfg.lpm_eta * min(1.0, float(iteration) / float(cfg.lpm_warmup_steps))
-
         # --- Interaction & intrinsic bookkeeping (intrinsic NOT stored as reward) ---
         with torch.no_grad():
             action, _pred_obs_normalized = agent(obs, eval=False)
@@ -764,26 +769,30 @@ def main():
                 # True next obs tensor (1,C,H,W) in the same normalized space as training
                 true_next = torch.as_tensor(next_obs_normalized, device=device).permute(2, 0, 1).unsqueeze(0)
 
+                # --- LPM: Intrinsic Reward Calculation (Reliability-Gated) ---
+                
+                # 1. Determine eta_current based on Reliability Gating
+                #    If ep_reliability is 0 (random predictor), eta_current becomes 0 (no random pressure).
+                eta_current = eta_base * ep_reliability
+
                 # NLL as "prediction error"
                 t_next_obs_dist = decoder(t_next_state, t_next_rnn)
                 eps_current = float((-t_next_obs_dist.log_prob(true_next)).mean().item())
 
-                # g_phi predicts expected error (trained from previous cycle)
+                # Predict EXPECTED error current
                 pred_prev_eps = float(error_predictor(t_last_state, t_last_rnn, t_action).item())
 
-                # LPM delta
+                # Delta = (Predicted Error) - (Actual Error)
+                # If we predicted "High Error" but got "Low Error" -> Positive Surprise (Learning Progress)
                 delta_raw = pred_prev_eps - eps_current
 
-                # Normalize delta (only once EP is at least somewhat trained)
-                if ep_ready:
-                    delta_rms.update(delta_raw)
-                    delta_norm = (delta_raw - delta_rms.mean) / (delta_rms.std + 1e-8)
-                    delta_norm_clipped = float(np.clip(delta_norm, -cfg.lpm_clip, cfg.lpm_clip))
-                    intr_eta_scaled = float(np.clip(eta_current * delta_norm_clipped, -cfg.lpm_clip, cfg.lpm_clip))
-                else:
-                    # keep intrinsic off until EP has been trained at least once
-                    delta_norm_clipped = 0.0
-                    intr_eta_scaled = 0.0
+                # Normalize and Clip
+                delta_rms.update(delta_raw)
+                delta_norm = (delta_raw - delta_rms.mean) / (delta_rms.std + 1e-8)
+                delta_norm_clipped = float(np.clip(delta_norm, -cfg.lpm_clip, cfg.lpm_clip))
+                
+                # Apply eta_current (Gated)
+                intr_eta_scaled = float(np.clip(eta_current * delta_norm_clipped, -cfg.lpm_clip, cfg.lpm_clip))
 
                 # Store for training EP and intrinsic reward model from D
                 # Store on CPU to keep memory stable.
@@ -805,6 +814,8 @@ def main():
                         "LPM/pred_prev_eps": pred_prev_eps,
                         "LPM/delta_raw": delta_raw,
                         "LPM/delta_norm_clipped": delta_norm_clipped,
+                        "LPM/eta_base": eta_base,
+                        "LPM/ep_reliability": ep_reliability,
                         "LPM/eta_current": eta_current,
                         "LPM/intrinsic_eta_scaled": intr_eta_scaled,
                     }
@@ -828,10 +839,25 @@ def main():
                     obs = obs[0]
                 agent.reset()
 
-                print(f"Episode {total_episode} ExtReward: {np.mean(total_reward):.4f}")
+                # --- Reward Feedback Logic (Recent Average Feedback) ---
+                recent_ext_rewards.append(np.mean(total_reward)) # average reward per episode
+                avg_recent_reward = np.mean(recent_ext_rewards) if recent_ext_rewards else 0.0
+
+                if avg_recent_reward > 0:
+                    # Focus Phase: Decay eta_base towards focus_eta
+                    eta_base = eta_base * cfg.lpm_decay_rate + cfg.lpm_focus_eta * (1 - cfg.lpm_decay_rate)
+                else:
+                    # Discovery/Recovery Phase: Instant recovery to full potential
+                    # (But effective eta is still limited by ep_reliability)
+                    eta_base = cfg.lpm_eta
+
+                print(f"Episode {total_episode} ExtReward: {np.mean(total_reward):.4f} (Avg10: {avg_recent_reward:.4f})")
+                print(f"  > LPM State: Base_Eta={eta_base:.3f} * Reliability={ep_reliability:.3f} -> Eta={eta_current:.3f}")
+
                 if args.wandb:
                     wandb.log({
                         "Episode/Extrinsic_Reward": np.mean(total_reward),
+                        "Episode/Avg_Recent_Reward": avg_recent_reward,
                         "Episode/Steps": iteration,
                         "Episode/ID": total_episode
                     }, step=iteration)
@@ -939,16 +965,27 @@ def main():
                 pred = error_predictor(z_batch, h_batch, a_batch).squeeze(-1)
                 ep_loss_D = F.mse_loss(pred, eps_batch)
 
+                # --- R2 (Reliability) Calculation ---
+                with torch.no_grad():
+                    ep_variance = torch.var(eps_batch)
+                    if ep_variance < 1e-8:
+                        ep_variance = 1.0 # Avoid division by zero
+                    
+                    # R2 = 1 - MSE / Variance
+                    # If MSE > Variance (worse than mean), R2 becomes negative.
+                    ep_r2 = 1.0 - ep_loss_D / ep_variance
+                    
+                    # Clip: Treat "Learning < Mean" as "Unreliable (0.0)"
+                    ep_reliability = float(torch.clamp(ep_r2, 0.0, 1.0).item())
+
                 ep_optimizer.zero_grad()
                 ep_loss_D.backward()
                 clip_grad_norm_(error_predictor.parameters(), cfg.gradient_clipping)
                 ep_optimizer.step()
 
-                ep_ready = True
-
             # --- Train intrinsic reward model on D (normalized/clipped targets) ---
-            # Only train once EP is ready (otherwise targets were forced to 0)
-            if ep_ready and len(D_queue) >= max(4, min(cfg.intr_batch_size, len(D_queue))):
+            # Train if we have enough data (Reliability is handled by R2 check above)
+            if len(D_queue) >= max(4, min(cfg.intr_batch_size, len(D_queue))):
                 batch_size_I = min(cfg.intr_batch_size, len(D_queue))
                 idx = np.random.choice(len(D_queue), size=batch_size_I, replace=False)
                 batch = [D_queue[i] for i in idx]
@@ -1013,11 +1050,10 @@ def main():
                 i_actions, i_action_log_probs, i_action_entropys = actor(flat_s, flat_h)
 
                 # intrinsic reward predicted on (s,h,a) before transition
-                if ep_ready:
-                    intr_pred = intrinsic_model(flat_s, flat_h, i_actions).squeeze(-1)
-                    imagined_intr[i - 1] = intr_pred
-                else:
-                    imagined_intr[i - 1] = 0.0
+                # Note: intrinsic_model is always trained on D_queue, so it's valid.
+                # However, if reliability is 0, eta_current is 0, so this term vanishes anyway.
+                intr_pred = intrinsic_model(flat_s, flat_h, i_actions).squeeze(-1)
+                imagined_intr[i - 1] = intr_pred
 
                 flat_h = rssm.recurrent(flat_s, i_actions, flat_h)
                 flat_prior = rssm.get_prior(flat_h)
@@ -1036,7 +1072,8 @@ def main():
             # Extrinsic reward from reward_model (learned on true env reward only)
             imagined_rewards_ext = reward_model(flatten_imagined_states, flatten_imagined_rnn_hiddens).mean.view(cfg.imagination_horizon, -1)
 
-            # Intrinsic (normalized/clipped) predicted reward, scaled by eta warmup
+            # Intrinsic (normalized/clipped) predicted reward, scaled by Gated Eta
+            # eta_current is updated in the rollout loop based on Reliability * Base
             imagined_rewards_int = imagined_intr  # already horizon x batch
             imagined_rewards_total = imagined_rewards_ext + eta_current * imagined_rewards_int
 
