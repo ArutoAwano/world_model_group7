@@ -120,32 +120,7 @@ class Agent(embodied.jax.Agent):
 
   def init_train(self, batch_size):
     # Initialize policy state (enc, dyn, dec, prevact)
-    policy_carry = self.init_policy(batch_size)
-    
-    # Debug: Check structure of policy_carry
-    if not isinstance(policy_carry, dict):
-         raise ValueError(f"Init_train: Policy carry must be dict, got {type(policy_carry)}")
-    
-    D_size = getattr(self.config, 'lpm_d_size', 5000)
-    z_dim = self.dyn.deter + self.dyn.stoch * self.dyn.classes
-    if getattr(self.act_space['action'], 'discrete', False):
-        if hasattr(self.act_space['action'], 'high') and len(self.act_space['action'].high.shape) == 0:
-            a_dim = int(self.act_space['action'].high)
-        else:
-            a_dim = self.act_space['action'].high
-    else:
-        a_dim = sum(np.prod(s.shape) for s in self.act_space.values())
-    
-    d_queue = {
-        'z': jnp.zeros((D_size, z_dim), f32),
-        'a': jnp.zeros((D_size, a_dim), f32),
-        'eps': jnp.zeros((D_size,), f32),
-        'ptr': jnp.zeros((1,), i32),
-        'count': jnp.zeros((1,), i32),
-    }
-    
-    # Return dictionary carry to robustly separate policy and lpm state
-    return {'policy': policy_carry, 'lpm': d_queue}
+    return self.init_policy(batch_size)
 
   def init_report(self, batch_size):
     # Report uses same carry structure as train (5 elements)
@@ -199,27 +174,7 @@ class Agent(embodied.jax.Agent):
     if not isinstance(global_step, jax.Array):
       global_step = jnp.array(global_step, dtype=jnp.float32)
     
-  def train(self, carry, data, global_step=0.0):
-    if not isinstance(global_step, jax.Array):
-      global_step = jnp.array(global_step, dtype=jnp.float32)
-    
-    # carry must be a dict with 'policy' and 'lpm' keys
-    if isinstance(carry, dict):
-        d_queue = carry['lpm']
-        policy_carry = carry['policy']
-        
-        # Apply replay context to policy carry
-        policy_carry, obs, prevact, stepid = self._apply_replay_context(policy_carry, data)
-        
-        # DEBUG: Check policy_carry length
-        if len(policy_carry) != 4:
-             raise ValueError(f"Train: policy_carry corrupted after replay context. Expected 4, got {len(policy_carry)}")
-        
-        # Re-attach d_queue for optimization step
-        carry = {'policy': policy_carry, 'lpm': d_queue}
-    else:
-        # Fallback (should not happen with new init_train)
-        carry, obs, prevact, stepid = self._apply_replay_context(carry, data)
+    carry, obs, prevact, stepid = self._apply_replay_context(carry, data)
     
     metrics, (carry, entries, outs, mets) = self.opt(
         self.loss, carry, obs, prevact, global_step, training=True, has_aux=True)
@@ -236,18 +191,7 @@ class Agent(embodied.jax.Agent):
     
     # Reconstruct carry for next step
     new_prevact = {k: data[k][:, -1] for k in self.act_space}
-    
-    if isinstance(carry, dict):
-         # carry from opt is dict {'policy': {'enc':..., 'dyn':...}, 'lpm': d_queue}
-         policy_carry = carry['policy']
-         d_queue = carry['lpm']
-         # Update prevact in policy dict
-         new_policy_carry = {'enc': policy_carry['enc'], 'dyn': policy_carry['dyn'], 'dec': policy_carry['dec'], 'prevact': new_prevact}
-         carry = {'policy': new_policy_carry, 'lpm': d_queue}
-    else:
-         # Fallback (unlikely)
-         carry = (*carry[:-1], new_prevact)
-
+    carry = {**carry, 'prevact': new_prevact}
     return carry, outs, metrics
     
   def _apply_replay_context(self, carry, data):
@@ -319,21 +263,10 @@ class Agent(embodied.jax.Agent):
 
 
   def loss(self, carry, obs, prevact, global_step, training):
-    if isinstance(carry, dict):
-        policy_carry = carry['policy']
-        d_queue = carry['lpm']
-    else:
-        # Fallback for old style or other use cases
-        policy_carry = carry
-        d_queue = None
-        
-    if not isinstance(policy_carry, dict):
-        raise ValueError(f"Loss: policy_carry expected dict, got {type(policy_carry)}")
-
-    enc_carry = policy_carry['enc']
-    dyn_carry = policy_carry['dyn']
-    dec_carry = policy_carry['dec']
-    prevact_unused = policy_carry['prevact']
+    enc_carry = carry['enc']
+    dyn_carry = carry['dyn']
+    dec_carry = carry['dec']
+    prevact_unused = carry['prevact']
     
     reset = obs['is_first']
     B, T = reset.shape
@@ -410,84 +343,18 @@ class Agent(embodied.jax.Agent):
         # However, it has been updated on *recent* data.
         pred_eps = self.lpm(lpm_inp, 2).pred() # (B, T-1)
         
-        # --- D_queue Logic For Training LPM ---
-        # 1. Update D_queue with (lpm_inp, eps_target)
-        # lpm_inp: (B, T-1, InputDim), eps_target: (B, T-1)
+        # No D_queue: Train Error Predictor/Intrinsic Model on current batch immediately
         # Flatten batch:
-        current_z = lpm_inp[:, :, :self.dyn.deter + self.dyn.stoch * self.dyn.classes] # Extract z part? No lpm_inp has z and a.
-        # Actually lpm_inp is already the concatenated feature.
-        # D_queue stores z and a separately or combined?
-        # Combined is easier.
         flat_inp = lpm_inp.reshape(-1, lpm_inp.shape[-1])
         flat_eps = eps_target.reshape(-1)
         
-        # Add to buffer (circularly)
-        # We can implement a pure jax scan or dynamic update.
-        # Since we are inside 'loss', we need to use JAX primitives.
-        # d_queue keys: 'inp': (D, dim), 'eps': (D,)
-        # Note: d_queue setup in init_policy was separated z/a. Let's merge for simplicity or keep separate.
-        # merged 'inp' is easier.
-        
-        batch_count = flat_inp.shape[0]
-        D_size = d_queue['eps'].shape[0]
-        ptr = d_queue['ptr']
-        
-        # Compute indices
-        indices = (ptr + jnp.arange(batch_count)) % D_size
-        
-        # Update buffer
-        # We need to split lpm_inp back to z and a if we want strictly 3 args like PyTorch, 
-        # or just store lpm_inp directly.
-        # lpm_inp contains z and a. Let's store lpm_inp.
-        # Re-initialize d_queue in init_policy if structure changes?
-        # Wait, I defined it as z, a, eps.
-        # Let's adapt to store (lpm_inp)
-        # We can't change init_policy now without multiple edits.
-        # I'll stick to 'z' and 'a'.
-        
-        z_dim = self.dyn.deter + self.dyn.stoch * self.dyn.classes
-        current_z = flat_inp[:, :z_dim]
-        current_a = flat_inp[:, z_dim:]
-        
-        d_queue['z'] = d_queue['z'].at[indices].set(current_z)
-        d_queue['a'] = d_queue['a'].at[indices].set(current_a)
-        d_queue['eps'] = d_queue['eps'].at[indices].set(flat_eps)
-        d_queue['ptr'] = (ptr + batch_count) % D_size
-        d_queue['count'] = jnp.minimum(d_queue['count'] + batch_count, D_size)
-        
-        # 2. Sample from D_queue for Training
-        # We want to train on D_queue data, NOT current batch data.
-        # Sample random indices from 0 to count.
-        rng = nj.seed()
-        # Ensure we have enough data
-        valid_count = d_queue['count']
-        # If empty, use current batch as fallback or skip?
-        # Use current batch if D is empty (start of training).
-        
-        def sample_d_queue(d_q, cnt, rng):
-            idx = jax.random.randint(rng, (self.config.lpm_batch_size,), 0, cnt)
-            z_batch = d_q['z'][idx]
-            a_batch = d_q['a'][idx]
-            eps_batch = d_q['eps'][idx]
-            return jnp.concatenate([z_batch, a_batch], -1), eps_batch
-
-        has_data = (valid_count >= self.config.lpm_batch_size).reshape(())
-        
-        def current_batch_fallback(inp, eps):
-             idx = jax.random.randint(rng, (self.config.lpm_batch_size,), 0, inp.shape[0])
-             return inp[idx], eps[idx]
-
-        train_inp, train_eps = jax.lax.cond(
-            has_data,
-            lambda: sample_d_queue(d_queue, valid_count, rng),
-            lambda: current_batch_fallback(flat_inp, flat_eps)
-        )
+        train_inp, train_eps = flat_inp, flat_eps
         
         # Train Error Predictor - periodic update
         update_interval = float(self.config.lpm_update_interval)
         should_update = (global_step % update_interval) < 1.0
         
-        # Calculate Loss on D_queue samples
+        # Calculate Loss on current samples
         lpm_loss_raw = self.lpm(train_inp, 1).loss(train_eps)
         losses['lpm'] = jnp.where(should_update, lpm_loss_raw, jnp.zeros_like(lpm_loss_raw))
         
@@ -496,7 +363,6 @@ class Agent(embodied.jax.Agent):
         delta = pred_eps - eps_target
         
         # Optional: Prevent negative reward (punishment) due to poor prediction
-        # Use ReLU (max(0, delta)) so early bad predictions don't punish the agent
         delta = jnp.maximum(0.0, delta)
         
         # 4. Normalize and Clip
@@ -505,25 +371,8 @@ class Agent(embodied.jax.Agent):
         delta_norm_clipped = jnp.clip(delta_norm, -self.config.lpm_clip, self.config.lpm_clip)
         
         # 5. Train Intrinsic Reward Model - also periodic
-        # Intrinsic Model predicts 'delta_norm_clipped'.
-        # Should we train this on D_queue too?
-        # D_queue stores (z, a, eps). It does NOT store delta.
-        # Delta depends on pred_eps(z).
-        # We can recompute delta for D_queue samples?
-        # delta_D = pred_eps(z_D) - eps_D.
-        # Yes, we can do that.
-        
-        # Predict on D_queue samples
-        pred_eps_D = self.lpm(train_inp, 1).pred()
-        delta_D = pred_eps_D - train_eps
-        delta_D = jnp.maximum(0.0, delta_D)
-        # Normalize? We should use the running stats from current batch or D batch?
-        # Usually running stats are updated on current batch online.
-        # We can apply the stats (frozen) to D batch.
-        delta_D_norm = (delta_D - delta_offset) / delta_scale
-        delta_D_clipped = jnp.clip(delta_D_norm, -self.config.lpm_clip, self.config.lpm_clip)
-        
-        intr_loss_raw = self.intr(train_inp, 1).loss(sg(delta_D_clipped))
+        # Predictive target for Intrinsic Model is the (clipped) Surprise
+        intr_loss_raw = self.intr(lpm_inp, 2).loss(sg(delta_norm_clipped))
         losses['intr'] = jnp.where(should_update, intr_loss_raw, jnp.zeros_like(intr_loss_raw))
         
         # Calculate Eta with Warmup
@@ -539,11 +388,6 @@ class Agent(embodied.jax.Agent):
         
         # Optional scale for lpm loss
         losses['lpm'] *= self.config.lpm_scale if hasattr(self.config, 'lpm_scale') else 1.0
-
-
-    # Imagination
-    K = min(self.config.imag_last or T, T)
-
 
     # Imagination
     K = min(self.config.imag_last or T, T)
@@ -617,10 +461,8 @@ class Agent(embodied.jax.Agent):
     
     new_policy_carry = {'enc': enc_carry, 'dyn': dyn_carry, 'dec': dec_carry, 'prevact': prevact_unused}
     
-    if d_queue is not None:
-         carry = {'policy': new_policy_carry, 'lpm': d_queue}
-    else:
-         carry = new_policy_carry
+    new_policy_carry = {'enc': enc_carry, 'dyn': dyn_carry, 'dec': dec_carry, 'prevact': prevact_unused}
+    carry = new_policy_carry
          
     entries = (enc_entries, dyn_entries, dec_entries)
     outs = {'tokens': tokens, 'repfeat': repfeat, 'losses': losses}
@@ -633,22 +475,9 @@ class Agent(embodied.jax.Agent):
     if not isinstance(global_step, jax.Array):
       global_step = jnp.array(global_step, dtype=jnp.float32)
 
+    policy_carry, obs, prevact, stepid = self._apply_replay_context(carry, data)
     # Handle D_queue separation for report as well
-    # Handle D_queue separation for report as well
-    d_queue = None
-    if isinstance(carry, dict):
-        d_queue = carry['lpm']
-        policy_carry = carry['policy']
-    else:
-        policy_carry = carry
-
-    policy_carry, obs, prevact, _ = self._apply_replay_context(policy_carry, data)
-    
-    # Re-attach d_queue if it existed
-    if d_queue is not None:
-        loss_carry = {'policy': policy_carry, 'lpm': d_queue}
-    else:
-        loss_carry = policy_carry
+    loss_carry = policy_carry
 
     enc_carry = policy_carry['enc']
     dyn_carry = policy_carry['dyn']
@@ -662,7 +491,7 @@ class Agent(embodied.jax.Agent):
         loss_carry, obs, prevact, global_step, training=False)
     # new_carry from loss has 5 items (enc, dyn, dec, prevact_unused, d_queue)
     
-    mets.update(mets)
+    metrics.update(mets)
 
     # Grad norms
     if self.config.report_gradnorms:
@@ -712,13 +541,7 @@ class Agent(embodied.jax.Agent):
       metrics[f'openloop/{key}'] = grid
 
     new_prevact = {k: data[k][:, -1] for k in self.act_space}
-    if isinstance(new_carry, dict):
-         policy_carry = new_carry['policy']
-         d_queue = new_carry['lpm']
-         new_policy_carry = {'enc': policy_carry['enc'], 'dyn': policy_carry['dyn'], 'dec': policy_carry['dec'], 'prevact': new_prevact}
-         carry = {'policy': new_policy_carry, 'lpm': d_queue}
-    else:
-         carry = (*new_carry[:-1], new_prevact)
+    carry = {**new_carry, 'prevact': new_prevact}
     return carry, metrics
 
 
