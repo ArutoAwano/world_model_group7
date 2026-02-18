@@ -3,10 +3,10 @@
 本プロジェクトは `experiments/` フォルダ内に構成されています。
 全ての実験はDockerコンテナ内で行います。
 
-Experiment1でDreamerV3の動作確認，Experiment2でNoisyTVWrapperの動作確認を行った．
-本実験ではExperiment6の再構成誤差を内的報酬とする実験をベースラインとして，Reward modelを分離させていないExperiment3と分離させたExperiment4.5を比較する．
-他のExperimentについては最終課題に取り組む中で行った試行錯誤の名残です．
-最後にlogdirフォルダ内のメトリクスを用いて学習曲線をグラフ化し，結果を確認します．
+Experiment1でDreamerV3の動作確認，Experiment2でNoisyTVWrapperの動作確認を行った． \
+本実験ではExperiment6の再構成誤差を内的報酬とする実験をベースラインとして，Reward modelを分離させていないExperiment3と分離させたExperiment4.5を比較する． \
+他のExperimentについては最終課題に取り組む中で行った試行錯誤の名残です． \
+最後にlogdirフォルダ内のメトリクスを用いて学習曲線をグラフ化し，結果を確認します． \
 
 **共通事項:**
 *   カレントディレクトリ: プロジェクトルート (`world_model_group7`)
