@@ -1,4 +1,4 @@
-# World Model Competition Group 7 - Experiment Instructions
+# World Model Competition Group 7 
 
 本プロジェクトは `experiments/` フォルダ内に構成されています。
 全ての実験はDockerコンテナ内で行います。
@@ -6,7 +6,7 @@
 Experiment1でDreamerV3の動作確認，Experiment2でNoisyTVWrapperの動作確認を行った． \
 本実験ではExperiment6の再構成誤差を内的報酬とする実験をベースラインとして，Reward modelを分離させていないExperiment3と分離させたExperiment4.5を比較する． \
 他のExperimentについては最終課題に取り組む中で行った試行錯誤の名残です． \
-最後にlogdirフォルダ内のメトリクスを用いて学習曲線をグラフ化し，結果を確認します． \
+最後にlogdirフォルダ内のメトリクスを用いて学習曲線をグラフ化し，結果を確認します． 
 
 **共通事項:**
 *   カレントディレクトリ: プロジェクトルート (`world_model_group7`)
@@ -16,7 +16,7 @@ Experiment1でDreamerV3の動作確認，Experiment2でNoisyTVWrapperの動作�
 
 ---
 
-## 1. Experiment 1: Origin (Reference)
+## 1. Experiment 1: Origin
 オリジナルのDreamerV3 (JAX) による基準性能の確認。
 
 **設定:** `configs: atari100k`
@@ -46,7 +46,7 @@ docker run -it --gpus all \
 
 ---
 
-## 2. Experiment 2: Noisy-TV (Baseline)
+## 2. Experiment 2: Noisy-TV
 行動空間依存のNoisy-TV環境下でのDreamerV3の性能確認 (LPMなし)。
 `torch` 依存が含まれるため、専用のDockerイメージを使用します。
 
@@ -115,7 +115,6 @@ docker run -it --gpus all \
 ---
 
 ## 4. Experiment 4: LPM 
-
 
 **設定:** `configs: atari100k_lpm`
 **タスク:** `atari100k_bank_heist`
@@ -196,7 +195,7 @@ docker run -it --gpus all \
 
 ---
 
-## 5. Experiment 5: LPM Scheduling (Proposed)
+## 5. Experiment 5: LPM Scheduling
 
 LPMのスケジューリング（Focus Phase / Discovery Phase）を実装した実験環境です。
 
@@ -278,7 +277,7 @@ docker run -it --gpus all \
 
 ---
 
-## 7. Experiment 7: critic_separated Critic (Proposed)
+## 7. Experiment 7: critic_separated Critic
 外発的報酬と内発的報酬のCriticを分離し、両者のバランスを調整可能にした実験環境です。
 内発的報酬の種類をLPM とReconstruction Errorから選択できます。
 動作環境は `Experiment 3: LPM` と互換性があります。
@@ -361,7 +360,7 @@ python3 plot_detailed_metrics.py --logdir ~/logdir/dreamerv3_origin_bankheist_40
 
 **出力:**
 *   実行ディレクトリに `detailed_metrics.png` が生成されます。
-*   Loss系（Image, Dynamics, Policy等）は対数グラフ(Log Scale)で、Scoreなどは線形グラフ(Linear Scale)でプロットされます。
+*   Loss系（Image, Dynamics, Policy等）は対数グラフで、Scoreなどは線形グラフでプロットされます。
 
 ### 複数実験の比較プロット
 複数の実験ログを読み込み、一つのグラフにまとめて比較します。
