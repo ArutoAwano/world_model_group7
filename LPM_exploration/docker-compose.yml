@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  lpm-dreamer:
+    build: .
+    image: lpm-dreamer:latest
+    container_name: lpm-dreamer
+    volumes:
+      - .:/workspace
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - WANDB_API_KEY=${WANDB_API_KEY}
+    ports:
+      - "8888:8888" # For Jupyter / Lab if needed
+    tty: true
+    stdin_open: true
+    command: bash
