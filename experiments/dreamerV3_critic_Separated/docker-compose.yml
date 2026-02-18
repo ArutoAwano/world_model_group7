@@ -1,0 +1,24 @@
+services:
+  verify:
+    build:
+      context: ../dreamerV3_LPM
+      dockerfile: Dockerfile
+    image: dreamerv3-lpm
+    volumes:
+      - .:/app
+      - ~/logdir:/logdir
+    env_file:
+      - ../../.env
+    environment:
+      - XLA_PYTHON_CLIENT_PREALLOCATE=false
+      - XLA_PYTHON_CLIENT_MEM_FRACTION=0.85
+      - XLA_PYTHON_CLIENT_ALLOCATOR=platform
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [ gpu ]
+    command: >
+      python3 dreamerv3/main.py --configs debug --logdir /logdir/verify_separated_lpm --intrinsic_type lpm --run.steps 50 --task dummy_disc --jax.platform cpu

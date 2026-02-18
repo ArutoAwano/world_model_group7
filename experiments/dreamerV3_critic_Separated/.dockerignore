@@ -1,0 +1,11 @@
+
+# Python
+*.py[cod]
+__pycache__/
+dist/
+*.egg-info/
+
+# Large Directories
+logdir/
+data/
+wandb/
